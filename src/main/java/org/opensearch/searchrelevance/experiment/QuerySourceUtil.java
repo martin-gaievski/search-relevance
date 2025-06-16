@@ -71,7 +71,7 @@ public class QuerySourceUtil {
         }
         Map<String, Object> queryMap = (Map<String, Object>) fullQueryMap.get("query");
         if (queryMap.containsKey("hybrid") == false || queryMap.get("hybrid") instanceof Map<?, ?> == false) {
-            throw new IllegalArgumentException("query in search configuration does must be of type hybrid");
+            throw new IllegalArgumentException("query in search configuration must be of type hybrid");
         }
         Map<String, Object> hybridMap = (Map<String, Object>) queryMap.get("hybrid");
         if (hybridMap.containsKey("queries") == false || hybridMap.get("queries") instanceof List<?> == false) {

@@ -10,6 +10,7 @@ package org.opensearch.searchrelevance.action.experiments;
 import static org.opensearch.searchrelevance.common.PluginConstants.EVALUATION_RESULT_INDEX;
 import static org.opensearch.searchrelevance.common.PluginConstants.EXPERIMENTS_URI;
 import static org.opensearch.searchrelevance.common.PluginConstants.EXPERIMENT_INDEX;
+import static org.opensearch.searchrelevance.common.PluginConstants.EXPERIMENT_VARIANT_INDEX;
 import static org.opensearch.searchrelevance.common.PluginConstants.JUDGMENTS_URL;
 import static org.opensearch.searchrelevance.common.PluginConstants.QUERYSETS_URL;
 import static org.opensearch.searchrelevance.common.PluginConstants.SEARCH_CONFIGURATIONS_URL;
@@ -68,6 +69,7 @@ public class ExperimentIT extends BaseSearchRelevanceIT {
         )
     );
     private static final String INDEX_NAME_ESCI = "ecommerce";
+    public static final int NUMBER_OF_HYBRID_OPTIMIZER_EXPERIMENT_VARIANTS = 66;
 
     @SneakyThrows
     public void testPointwiseEvaluationExperiment_whenQueryWithPlaceholder_thenSuccessful() {
@@ -84,6 +86,25 @@ public class ExperimentIT extends BaseSearchRelevanceIT {
         // Assert
         Map<String, String> queryTextToEvaluationId = assertExperimentCreation(experimentId, judgmentId, searchConfigurationId, querySetId);
         assertEvaluationResults(queryTextToEvaluationId, judgmentId, searchConfigurationId);
+
+        deleteIndex(INDEX_NAME_ESCI);
+    }
+
+    @SneakyThrows
+    public void testHybridOptimizerExperiment_whenHybridQueries_thenSuccessful() {
+        // Arrange
+        initializeIndexIfNotExist(INDEX_NAME_ESCI);
+
+        String hybridSearchConfigId = createHybridSearchConfiguration();
+        String querySetId = createQuerySet();
+        String judgmentId = createJudgment();
+
+        // Act
+        String experimentId = createHybridOptimizerExperiment(querySetId, hybridSearchConfigId, judgmentId);
+
+        // Assert
+        assertHybridOptimizerExperimentCreation(experimentId, judgmentId, hybridSearchConfigId, querySetId);
+        assertHybridOptimizerExperimentVariants(experimentId);
 
         deleteIndex(INDEX_NAME_ESCI);
     }
@@ -193,6 +214,248 @@ public class ExperimentIT extends BaseSearchRelevanceIT {
         return queryTextToEvaluationId;
     }
 
+    private void assertHybridOptimizerExperimentVariants(String experimentId) throws IOException {
+        // For each query term, check experiment variants
+        for (String queryTerm : EXPECTED_QUERY_TERMS) {
+            assertHybridOptimizerExperimentVariantsForQuery(experimentId, queryTerm);
+        }
+    }
+
+    private void assertHybridOptimizerExperimentVariantsForQuery(String experimentId, String queryText) throws IOException {
+        // First get all evaluation results for this query text
+        String getEvaluationResultsUrl = String.join("/", EVALUATION_RESULT_INDEX, "_search");
+        String evaluationResultsQuery = "{ \"size\": 100, \"query\": { \"bool\": { \"must\": [ "
+            + "  { \"term\": { \"searchText\": \""
+            + queryText
+            + "\" } } "
+            + "] } } }";
+
+        Response getEvaluationResponse = makeRequest(
+            client(),
+            RestRequest.Method.POST.name(),
+            getEvaluationResultsUrl,
+            null,
+            toHttpEntity(evaluationResultsQuery),
+            ImmutableList.of(new BasicHeader(HttpHeaders.USER_AGENT, DEFAULT_USER_AGENT))
+        );
+
+        Map<String, Object> getEvaluationResultJson = entityAsMap(getEvaluationResponse);
+        Map<String, Object> hitsObj = (Map<String, Object>) getEvaluationResultJson.get("hits");
+        List<Map<String, Object>> evaluationHits = (List<Map<String, Object>>) hitsObj.get("hits");
+
+        // Extract the evaluation result IDs
+        List<String> evaluationIds = new ArrayList<>();
+        for (Map<String, Object> hit : evaluationHits) {
+            String evalId = (String) hit.get("_id");
+            evaluationIds.add(evalId);
+        }
+
+        // We should have found some evaluation results
+        assertFalse("Should have evaluation results for query: " + queryText, evaluationIds.isEmpty());
+
+        // Now get the experiment variants that reference these evaluation result IDs
+        String getVariantsUrl = String.join("/", EXPERIMENT_VARIANT_INDEX, "_search");
+
+        // We need to use nested query for results.evaluationResultId
+        StringBuilder queryBuilder = new StringBuilder();
+        queryBuilder.append("{ \"size\": 100, \"query\": { \"bool\": { \"must\": [ ");
+        queryBuilder.append("  { \"term\": { \"experimentId\": \"").append(experimentId).append("\" } }, ");
+        queryBuilder.append("  { \"nested\": { ");
+        queryBuilder.append("      \"path\": \"results\", ");
+        queryBuilder.append("      \"query\": { ");
+        queryBuilder.append("        \"terms\": { ");
+        queryBuilder.append("          \"results.evaluationResultId\": [");
+
+        for (int i = 0; i < evaluationIds.size(); i++) {
+            queryBuilder.append("\"").append(evaluationIds.get(i)).append("\"");
+            if (i < evaluationIds.size() - 1) {
+                queryBuilder.append(", ");
+            }
+        }
+
+        queryBuilder.append("]}}}}]}}}");
+
+        Response getVariantsResponse = makeRequest(
+            client(),
+            RestRequest.Method.POST.name(),
+            getVariantsUrl,
+            null,
+            toHttpEntity(queryBuilder.toString()),
+            ImmutableList.of(new BasicHeader(HttpHeaders.USER_AGENT, DEFAULT_USER_AGENT))
+        );
+
+        Map<String, Object> getVariantsResultJson = entityAsMap(getVariantsResponse);
+        Map<String, Object> variantHitsObj = (Map<String, Object>) getVariantsResultJson.get("hits");
+        List<Map<String, Object>> variantHits = (List<Map<String, Object>>) variantHitsObj.get("hits");
+
+        // We should have found some experiment variants
+        assertFalse("Should have experiment variants for query: " + queryText, variantHits.isEmpty());
+
+        // We should have multiple variants for each query
+        assertEquals(NUMBER_OF_HYBRID_OPTIMIZER_EXPERIMENT_VARIANTS, variantHits.size());
+
+        // Verify structure of a few variants
+        int variantsToCheck = Math.min(5, variantHits.size());
+        for (int i = 0; i < variantsToCheck; i++) {
+            Map<String, Object> source = (Map<String, Object>) variantHits.get(i).get("_source");
+            assertNotNull(source);
+
+            assertEquals(experimentId, source.get("experimentId"));
+
+            // Parameters are nested in a "parameters" object
+            Map<String, Object> parameters = (Map<String, Object>) source.get("parameters");
+            assertNotNull("Parameters object should exist", parameters);
+            assertNotNull("Normalization should exist", parameters.get("normalization"));
+            assertNotNull("Combination should exist", parameters.get("combination"));
+            assertNotNull("Weights should exist", parameters.get("weights"));
+
+            // Check results
+            Map<String, Object> results = (Map<String, Object>) source.get("results");
+            assertNotNull("Results should exist", results);
+            String evaluationResultId = (String) results.get("evaluationResultId");
+            assertNotNull("Evaluation result ID should exist", evaluationResultId);
+
+            // Verify the evaluation result exists and has the correct query text
+            verifyEvaluationResult(evaluationResultId, queryText);
+        }
+    }
+
+    private void verifyEvaluationResult(String evaluationResultId, String queryText) throws IOException {
+        String getEvaluationByIdUrl = String.join("/", EVALUATION_RESULT_INDEX, "_doc", evaluationResultId);
+        Response getEvaluationResponse = makeRequest(
+            client(),
+            RestRequest.Method.GET.name(),
+            getEvaluationByIdUrl,
+            null,
+            null,
+            ImmutableList.of(new BasicHeader(HttpHeaders.USER_AGENT, DEFAULT_USER_AGENT))
+        );
+        Map<String, Object> getEvaluationResultJson = entityAsMap(getEvaluationResponse);
+        assertNotNull(getEvaluationResultJson);
+
+        Map<String, Object> evaluationSource = (Map<String, Object>) getEvaluationResultJson.get("_source");
+        assertNotNull(evaluationSource);
+
+        // Verify the search text matches the query
+        assertEquals("Evaluation search text should match query", queryText, evaluationSource.get("searchText"));
+
+        // Verify we have metrics
+        List<Map> metrics = (List<Map>) evaluationSource.get("metrics");
+        assertNotNull("Metrics should exist", metrics);
+        assertFalse("Metrics should not be empty", metrics.isEmpty());
+
+        // Verify we have document IDs
+        List<String> documentIds = (List<String>) evaluationSource.get("documentIds");
+        assertNotNull("Document IDs should exist", documentIds);
+        assertFalse("Document IDs should not be empty", documentIds.isEmpty());
+    }
+
+    private void assertHybridOptimizerExperimentCreation(
+        String experimentId,
+        String judgmentId,
+        String searchConfigurationId,
+        String querySetId
+    ) throws IOException {
+        // Poll for experiment status until it's no longer PROCESSING
+        Map<String, Object> source = pollExperimentUntilCompleted(experimentId);
+
+        // Continue with other assertions
+        assertNotNull(source.get("id"));
+        assertNotNull(source.get("timestamp"));
+
+        List<String> judgmentList = (List<String>) source.get("judgmentList");
+        assertNotNull(judgmentList);
+        assertEquals(1, judgmentList.size());
+        assertEquals(judgmentId, judgmentList.get(0));
+
+        List<String> searchConfigurationList = (List<String>) source.get("searchConfigurationList");
+        assertNotNull(searchConfigurationList);
+        assertEquals(1, searchConfigurationList.size());
+        assertEquals(searchConfigurationId, searchConfigurationList.get(0));
+
+        assertEquals("HYBRID_OPTIMIZER", source.get("type"));
+        assertEquals(querySetId, source.get("querySetId"));
+    }
+
+    private Map<String, Object> pollExperimentUntilCompleted(String experimentId) throws IOException {
+        Map<String, Object> source = null;
+        String getExperimentByIdUrl = String.join("/", EXPERIMENT_INDEX, "_doc", experimentId);
+
+        // Define timeout parameters
+        final int MAX_RETRIES = 60;  // Maximum number of retries
+        final int RETRY_INTERVAL_MS = 50000;  // 5 seconds between retries
+        int retryCount = 0;
+
+        String status = "PROCESSING";
+
+        while ("PROCESSING".equals(status) && retryCount < MAX_RETRIES) {
+            Response getExperimentResponse = makeRequest(
+                client(),
+                RestRequest.Method.GET.name(),
+                getExperimentByIdUrl,
+                null,
+                null,
+                ImmutableList.of(new BasicHeader(HttpHeaders.USER_AGENT, DEFAULT_USER_AGENT))
+            );
+            Map<String, Object> getExperimentResultJson = entityAsMap(getExperimentResponse);
+            assertNotNull(getExperimentResultJson);
+            assertEquals(experimentId, getExperimentResultJson.get("_id").toString());
+
+            source = (Map<String, Object>) getExperimentResultJson.get("_source");
+            assertNotNull(source);
+            status = (String) source.get("status");
+
+            if ("PROCESSING".equals(status)) {
+                retryCount++;
+                try {
+                    Thread.sleep(RETRY_INTERVAL_MS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }
+
+        // Assert that we have a valid experiment status
+        assertNotNull("Experiment status should not be null", status);
+        // If we reached max retries and still processing, fail the test
+        if ("PROCESSING".equals(status)) {
+            fail("Experiment is still processing after maximum wait time");
+        }
+        try {
+            Thread.sleep(2000); // 5-second delay after refresh
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+
+        // Refresh all related indices to ensure documents are available for search
+        makeRequest(
+            client(),
+            RestRequest.Method.POST.name(),
+            EXPERIMENT_VARIANT_INDEX + "/_refresh",
+            null,
+            null,
+            ImmutableList.of(new BasicHeader(HttpHeaders.USER_AGENT, DEFAULT_USER_AGENT))
+        );
+
+        makeRequest(
+            client(),
+            RestRequest.Method.POST.name(),
+            EVALUATION_RESULT_INDEX + "/_refresh",
+            null,
+            null,
+            ImmutableList.of(new BasicHeader(HttpHeaders.USER_AGENT, DEFAULT_USER_AGENT))
+        );
+
+        // Add delay to ensure data propagation
+        try {
+            Thread.sleep(10000); // 5-second delay after refresh
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        return source;
+    }
+
     private String createExperiment(String querySetId, String searchConfigurationId, String judgmentId) throws IOException,
         URISyntaxException, InterruptedException {
         String createExperimentBody = replacePlaceholders(
@@ -213,6 +476,27 @@ public class ExperimentIT extends BaseSearchRelevanceIT {
         assertEquals("CREATED", createExperimentResultJson.get("experiment_result").toString());
 
         Thread.sleep(1000);
+        return experimentId;
+    }
+
+    private String createHybridOptimizerExperiment(String querySetId, String searchConfigurationId, String judgmentId) throws IOException,
+        URISyntaxException, InterruptedException {
+        String createExperimentBody = replacePlaceholders(
+            Files.readString(Path.of(classLoader.getResource("experiment/CreateExperimentHybridOptimizer.json").toURI())),
+            Map.of("query_set_id", querySetId, "search_config_id", searchConfigurationId, "judgment_id", judgmentId)
+        );
+        Response createExperimentResponse = makeRequest(
+            client(),
+            RestRequest.Method.PUT.name(),
+            EXPERIMENTS_URI,
+            null,
+            toHttpEntity(createExperimentBody),
+            ImmutableList.of(new BasicHeader(HttpHeaders.USER_AGENT, DEFAULT_USER_AGENT))
+        );
+        Map<String, Object> createExperimentResultJson = entityAsMap(createExperimentResponse);
+        String experimentId = createExperimentResultJson.get("experiment_id").toString();
+        assertNotNull(experimentId);
+        assertEquals("CREATED", createExperimentResultJson.get("experiment_result").toString());
         return experimentId;
     }
 
@@ -255,6 +539,25 @@ public class ExperimentIT extends BaseSearchRelevanceIT {
     private String createSearchConfiguration() {
         String createSearchConfigurationRequestBody = Files.readString(
             Path.of(classLoader.getResource("searchconfig/CreateSearchConfigurationQueryWithPlaceholder.json").toURI())
+        );
+        Response createSearchConfigurationResponse = makeRequest(
+            client(),
+            RestRequest.Method.PUT.name(),
+            SEARCH_CONFIGURATIONS_URL,
+            null,
+            toHttpEntity(createSearchConfigurationRequestBody),
+            ImmutableList.of(new BasicHeader(HttpHeaders.USER_AGENT, DEFAULT_USER_AGENT))
+        );
+        Map<String, Object> createSearchConfigurationResultJson = entityAsMap(createSearchConfigurationResponse);
+        String searchConfigurationId = createSearchConfigurationResultJson.get("search_configuration_id").toString();
+        assertNotNull(searchConfigurationId);
+        return searchConfigurationId;
+    }
+
+    @SneakyThrows
+    private String createHybridSearchConfiguration() {
+        String createSearchConfigurationRequestBody = Files.readString(
+            Path.of(classLoader.getResource("searchconfig/CreateSearchConfigurationHybridQuery.json").toURI())
         );
         Response createSearchConfigurationResponse = makeRequest(
             client(),

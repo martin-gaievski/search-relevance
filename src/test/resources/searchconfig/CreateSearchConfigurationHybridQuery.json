@@ -1,0 +1,6 @@
+{
+    "name": "hybrid_query_1",
+    "index": "ecommerce",
+    "query": "{\"query\":{\"hybrid\":{\"queries\":[{\"match\":{\"title\":\"%SearchText%\"}},{\"match\":{\"category\":\"%SearchText%\"}}]}}}",
+    "searchPipeline": ""
+}
