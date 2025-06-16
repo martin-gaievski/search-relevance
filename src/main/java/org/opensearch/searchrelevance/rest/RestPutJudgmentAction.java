@@ -116,8 +116,8 @@ public class RestPutJudgmentAction extends BaseRestHandler {
                 List<String> searchConfigurationList = ParserUtils.convertObjToList(source, SEARCH_CONFIGURATION_LIST);
                 int size = (Integer) source.get(SIZE);
                 boolean ignoreFailure = Optional.ofNullable((Boolean) source.get(IGNORE_FAILURE)).orElse(Boolean.FALSE);  // default to
-                                                                                                                           // false if not
-                                                                                                                           // provided
+                                                                                                                          // false if not
+                                                                                                                          // provided
 
                 int tokenLimit = validateTokenLimit(source);
                 List<String> contextFields = ParserUtils.convertObjToList(source, CONTEXT_FIELDS);

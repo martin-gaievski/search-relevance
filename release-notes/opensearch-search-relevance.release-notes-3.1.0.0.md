@@ -30,3 +30,5 @@ Compatible with OpenSearch 3.1.0
 - Change model for Experiment and Evaluation Result entities: ([#99](https://github.com/opensearch-project/search-relevance/pull/99))
 - Refactor and fix LLM judgment duplication issue ([#98](https://github.com/opensearch-project/search-relevance/pull/98)))
 - add text validation and query set file size check ([#116](https://github.com/opensearch-project/search-relevance/pull/116)))
+- Fixed missing variants in Hybrid Optimizer ([#124](https://github.com/opensearch-project/search-relevance/pull/124))
+- Run integTests with security as a PR check ([#136](https://github.com/opensearch-project/search-relevance/pull/136))

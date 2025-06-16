@@ -189,7 +189,7 @@ public class ExperimentIT extends BaseSearchRelevanceIT {
     ) throws IOException {
         String getExperimentByIdUrl = String.join("/", EXPERIMENT_INDEX, "_doc", experimentId);
         Response getExperimentResponse = makeRequest(
-            client(),
+            adminClient(),
             RestRequest.Method.GET.name(),
             getExperimentByIdUrl,
             null,
@@ -426,7 +426,7 @@ public class ExperimentIT extends BaseSearchRelevanceIT {
     private Map<String, Object> getExperiment(String experimentId) throws IOException {
         String getExperimentByIdUrl = String.join("/", EXPERIMENT_INDEX, "_doc", experimentId);
         Response getExperimentResponse = makeRequest(
-            client(),
+            adminClient(),
             RestRequest.Method.GET.name(),
             getExperimentByIdUrl,
             null,
