@@ -48,7 +48,7 @@ import org.opensearch.searchrelevance.dao.QuerySetDao;
 import org.opensearch.searchrelevance.dao.SearchConfigurationDao;
 import org.opensearch.searchrelevance.indices.SearchRelevanceIndicesManager;
 import org.opensearch.searchrelevance.metrics.HybridSearchTaskManager;
-import org.opensearch.searchrelevance.metrics.MetricsHelperWithTaskQueue;
+import org.opensearch.searchrelevance.metrics.MetricsHelper;
 import org.opensearch.searchrelevance.ml.MLAccessor;
 import org.opensearch.searchrelevance.stats.info.InfoStatsManager;
 import org.opensearch.searchrelevance.transport.experiment.DeleteExperimentAction;
@@ -105,7 +105,7 @@ public class SearchRelevancePluginTests extends OpenSearchTestCase {
         EvaluationResultDao.class,
         JudgmentCacheDao.class,
         MLAccessor.class,
-        MetricsHelperWithTaskQueue.class,
+        MetricsHelper.class,
         InfoStatsManager.class,
         HybridSearchTaskManager.class
     );

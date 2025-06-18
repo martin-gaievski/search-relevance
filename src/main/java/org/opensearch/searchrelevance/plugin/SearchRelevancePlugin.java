@@ -51,7 +51,7 @@ import org.opensearch.searchrelevance.dao.QuerySetDao;
 import org.opensearch.searchrelevance.dao.SearchConfigurationDao;
 import org.opensearch.searchrelevance.indices.SearchRelevanceIndicesManager;
 import org.opensearch.searchrelevance.metrics.HybridSearchTaskManager;
-import org.opensearch.searchrelevance.metrics.MetricsHelperWithTaskQueue;
+import org.opensearch.searchrelevance.metrics.MetricsHelper;
 import org.opensearch.searchrelevance.ml.MLAccessor;
 import org.opensearch.searchrelevance.rest.RestCreateQuerySetAction;
 import org.opensearch.searchrelevance.rest.RestDeleteExperimentAction;
@@ -119,7 +119,7 @@ public class SearchRelevancePlugin extends Plugin implements ActionPlugin, Syste
     private EvaluationResultDao evaluationResultDao;
     private JudgmentCacheDao judgmentCacheDao;
     private MLAccessor mlAccessor;
-    private MetricsHelperWithTaskQueue metricsHelper;
+    private MetricsHelper metricsHelper;
     private SearchRelevanceSettingsAccessor settingsAccessor;
     private ClusterUtil clusterUtil;
     private InfoStatsManager infoStatsManager;
@@ -159,24 +159,18 @@ public class SearchRelevancePlugin extends Plugin implements ActionPlugin, Syste
         MachineLearningNodeClient mlClient = new MachineLearningNodeClient(client);
         this.mlAccessor = new MLAccessor(mlClient);
 
-        // Create HybridSearchTaskManager first
+        // Create HybridSearchTaskManager with settings for concurrency control
         HybridSearchTaskManager hybridSearchTaskManager = new HybridSearchTaskManager(
             client,
             clusterService,
             evaluationResultDao,
             experimentVariantDao,
-            threadPool
+            threadPool,
+            environment.settings()
         );
 
-        // Use MetricsHelperWithTaskQueue instead of MetricsHelper
-        this.metricsHelper = new MetricsHelperWithTaskQueue(
-            clusterService,
-            client,
-            judgmentDao,
-            evaluationResultDao,
-            experimentVariantDao,
-            hybridSearchTaskManager
-        );
+        // Use base MetricsHelper class
+        this.metricsHelper = new MetricsHelper(clusterService, client, judgmentDao, evaluationResultDao, experimentVariantDao);
 
         this.settingsAccessor = new SearchRelevanceSettingsAccessor(clusterService, environment.settings());
         this.clusterUtil = new ClusterUtil(clusterService);
@@ -249,6 +243,10 @@ public class SearchRelevancePlugin extends Plugin implements ActionPlugin, Syste
 
     @Override
     public List<Setting<?>> getSettings() {
-        return List.of(SEARCH_RELEVANCE_WORKBENCH_ENABLED, SEARCH_RELEVANCE_STATS_ENABLED, SEARCH_RELEVANCE_QUERY_SET_MAX_LIMIT);
+        return List.of(
+            SEARCH_RELEVANCE_WORKBENCH_ENABLED,
+            SEARCH_RELEVANCE_STATS_ENABLED,
+            SEARCH_RELEVANCE_QUERY_SET_MAX_LIMIT
+        );
     }
 }

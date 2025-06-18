@@ -36,7 +36,7 @@ import org.opensearch.searchrelevance.dao.QuerySetDao;
 import org.opensearch.searchrelevance.dao.SearchConfigurationDao;
 import org.opensearch.searchrelevance.exception.SearchRelevanceException;
 import org.opensearch.searchrelevance.metrics.HybridSearchTaskManager;
-import org.opensearch.searchrelevance.metrics.MetricsHelperWithTaskQueue;
+import org.opensearch.searchrelevance.metrics.MetricsHelper;
 import org.opensearch.searchrelevance.model.AsyncStatus;
 import org.opensearch.searchrelevance.model.Experiment;
 import org.opensearch.searchrelevance.model.ExperimentType;
@@ -56,7 +56,7 @@ public class PutExperimentTransportAction extends HandledTransportAction<PutExpe
     private final ExperimentVariantDao experimentVariantDao;
     private final QuerySetDao querySetDao;
     private final SearchConfigurationDao searchConfigurationDao;
-    private final MetricsHelperWithTaskQueue metricsHelper;
+    private final MetricsHelper metricsHelper;
     private final HybridSearchTaskManager hybridSearchTaskManager;
     private final HybridOptimizerTaskSupport hybridOptimizerTaskSupport;
 
@@ -71,7 +71,7 @@ public class PutExperimentTransportAction extends HandledTransportAction<PutExpe
         ExperimentVariantDao experimentVariantDao,
         QuerySetDao querySetDao,
         SearchConfigurationDao searchConfigurationDao,
-        MetricsHelperWithTaskQueue metricsHelper,
+        MetricsHelper metricsHelper,
         JudgmentDao judgmentDao,
         HybridSearchTaskManager hybridSearchTaskManager
     ) {
@@ -258,7 +258,8 @@ public class PutExperimentTransportAction extends HandledTransportAction<PutExpe
                             hasFailure,
                             judgmentList
                         );
-                    }, error -> handleFailure(error, hasFailure, experimentId, request))
+                    }, error -> handleFailure(error, hasFailure, experimentId, request)),
+                    Collections.emptyList()
                 );
             } else {
                 throw new SearchRelevanceException("Unknown experimentType" + request.getType(), RestStatus.BAD_REQUEST);
@@ -280,8 +281,25 @@ public class PutExperimentTransportAction extends HandledTransportAction<PutExpe
 
         try {
             synchronized (finalResults) {
-                queryResults.put(PAIRWISE_FIELD_NAME_QUERY_TEXT, queryText);
-                finalResults.add(queryResults);
+                // Handle different response formats based on experiment type
+                if (request.getType() == ExperimentType.HYBRID_OPTIMIZER) {
+                    // For HYBRID_OPTIMIZER, the response contains searchConfigurationResults
+                    List<Map<String, Object>> searchConfigResults = (List<Map<String, Object>>) queryResults.get(
+                        "searchConfigurationResults"
+                    );
+                    if (searchConfigResults != null) {
+                        for (Map<String, Object> configResult : searchConfigResults) {
+                            Map<String, Object> resultWithQuery = new HashMap<>(configResult);
+                            resultWithQuery.put(PAIRWISE_FIELD_NAME_QUERY_TEXT, queryText);
+                            finalResults.add(resultWithQuery);
+                        }
+                    }
+                } else {
+                    // For other experiment types, use the original format
+                    queryResults.put(PAIRWISE_FIELD_NAME_QUERY_TEXT, queryText);
+                    finalResults.add(queryResults);
+                }
+
                 if (pendingQueries.decrementAndGet() == 0) {
                     updateFinalExperiment(experimentId, request, finalResults, judgmentList);
                 }

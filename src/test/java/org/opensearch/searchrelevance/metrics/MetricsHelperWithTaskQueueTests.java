@@ -8,19 +8,14 @@
 package org.opensearch.searchrelevance.metrics;
 
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyInt;
-import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.times;
-import static org.mockito.Mockito.verify;
 
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.cluster.service.ClusterService;
@@ -156,150 +151,6 @@ public class MetricsHelperWithTaskQueueTests extends OpenSearchTestCase {
 
         // Assert
         assertTrue("Listener failure should be called for empty judgment IDs", failureCalled.get());
-    }
-
-    public void testProcessHybridExperimentOptionsWithValidInputShouldDelegateToTaskManager() {
-        // Arrange
-        String queryText = "test query";
-        int size = 10;
-        List<String> judgmentIds = Arrays.asList("judgment1");
-        Map<String, String> docIdToScores = Map.of("doc1", "3");
-        Map<String, Object> configToExperimentVariants = new HashMap<>();
-        AtomicBoolean responseCalled = new AtomicBoolean(false);
-
-        ActionListener<Map<String, Object>> listener = new ActionListener<>() {
-            @Override
-            public void onResponse(Map<String, Object> response) {
-                responseCalled.set(true);
-            }
-
-            @Override
-            public void onFailure(Exception e) {
-                fail("Should not fail: " + e.getMessage());
-            }
-        };
-
-        String searchConfigurationId = "config1";
-        String index = "index1";
-        String query = "{\"match_all\":{}}";
-        AtomicBoolean hasFailure = new AtomicBoolean(false);
-        AtomicInteger pendingConfigurations = new AtomicInteger(1);
-        List<ExperimentVariant> experimentVariants = createTestVariants();
-
-        // Mock task manager response
-        doAnswer(invocation -> {
-            ActionListener<Map<String, Object>> taskListener = invocation.getArgument(10);
-            Map<String, Object> mockResults = new HashMap<>();
-            mockResults.put("evaluationResults", Arrays.asList());
-            taskListener.onResponse(mockResults);
-            return null;
-        }).when(hybridSearchTaskManager)
-            .scheduleTasks(
-                anyString(),
-                anyString(),
-                anyString(),
-                anyString(),
-                anyString(),
-                anyInt(),
-                any(),
-                any(),
-                any(),
-                any(),
-                any(ActionListener.class),
-                any(),
-                any()
-            );
-
-        // Act
-        metricsHelper.processHybridExperimentOptions(
-            queryText,
-            size,
-            judgmentIds,
-            docIdToScores,
-            configToExperimentVariants,
-            listener,
-            searchConfigurationId,
-            index,
-            query,
-            hasFailure,
-            pendingConfigurations,
-            experimentVariants
-        );
-
-        // Assert
-        verify(hybridSearchTaskManager, times(1)).scheduleTasks(
-            anyString(),
-            anyString(),
-            anyString(),
-            anyString(),
-            anyString(),
-            anyInt(),
-            any(),
-            any(),
-            any(),
-            any(),
-            any(ActionListener.class),
-            any(),
-            any()
-        );
-        assertTrue("Response listener should be called", responseCalled.get());
-    }
-
-    public void testProcessHybridExperimentOptionsWithEmptyVariantsShouldThrowException() {
-        // Arrange
-        String queryText = "test query";
-        int size = 10;
-        List<String> judgmentIds = Arrays.asList("judgment1");
-        Map<String, String> docIdToScores = Map.of("doc1", "3");
-        Map<String, Object> configToExperimentVariants = new HashMap<>();
-
-        ActionListener<Map<String, Object>> listener = mock(ActionListener.class);
-
-        String searchConfigurationId = "config1";
-        String index = "index1";
-        String query = "{\"match_all\":{}}";
-        AtomicBoolean hasFailure = new AtomicBoolean(false);
-        AtomicInteger pendingConfigurations = new AtomicInteger(1);
-        List<ExperimentVariant> emptyVariants = Arrays.asList();
-
-        // Act & Assert
-        Exception exception = expectThrows(IllegalArgumentException.class, () -> {
-            metricsHelper.processHybridExperimentOptions(
-                queryText,
-                size,
-                judgmentIds,
-                docIdToScores,
-                configToExperimentVariants,
-                listener,
-                searchConfigurationId,
-                index,
-                query,
-                hasFailure,
-                pendingConfigurations,
-                emptyVariants
-            );
-        });
-
-        assertTrue(
-            "Exception message should mention empty variants",
-            exception.getMessage().contains("Experiment variant for hybrid search cannot be empty")
-        );
-
-        verify(hybridSearchTaskManager, times(0)).scheduleTasks(
-            anyString(),
-            anyString(),
-            anyString(),
-            anyString(),
-            anyString(),
-            anyInt(),
-            any(),
-            any(),
-            any(),
-            any(),
-            any(ActionListener.class),
-            any(),
-            any()
-        );
     }
 
     private List<ExperimentVariant> createTestVariants() {
