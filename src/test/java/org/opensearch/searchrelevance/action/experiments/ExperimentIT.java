@@ -73,8 +73,6 @@ public class ExperimentIT extends BaseSearchRelevanceIT {
     private static final int EXPECTED_VARIANTS_PER_QUERY = 66;
     // Timeout values
     private static final int MAX_POLL_RETRIES = 15;
-    private static final int POLL_INTERVAL_MS = 10000; // 10 seconds
-    private static final int POST_COMPLETION_WAIT_MS = 10000; // 10 seconds
 
     @SneakyThrows
     public void testPointwiseEvaluationExperiment_whenQueryWithPlaceholder_thenSuccessful() {
@@ -467,7 +465,7 @@ public class ExperimentIT extends BaseSearchRelevanceIT {
             if ("PROCESSING".equals(status) || status == null) {
                 retryCount++;
                 try {
-                    Thread.sleep(POLL_INTERVAL_MS);
+                    Thread.sleep(DEFAULT_INTERVAL_MS);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     break;
@@ -499,7 +497,7 @@ public class ExperimentIT extends BaseSearchRelevanceIT {
 
         // Add delay to ensure data propagation
         try {
-            Thread.sleep(POST_COMPLETION_WAIT_MS);
+            Thread.sleep(DEFAULT_INTERVAL_MS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
@@ -526,7 +524,7 @@ public class ExperimentIT extends BaseSearchRelevanceIT {
         assertNotNull(experimentId);
         assertEquals("CREATED", createExperimentResultJson.get("experiment_result").toString());
 
-        Thread.sleep(1000);
+        Thread.sleep(DEFAULT_INTERVAL_MS);
         return experimentId;
     }
 
@@ -566,7 +564,7 @@ public class ExperimentIT extends BaseSearchRelevanceIT {
         assertNotNull(judgmentId);
 
         // wait for completion of import action
-        Thread.sleep(1000);
+        Thread.sleep(DEFAULT_INTERVAL_MS);
         return judgmentId;
     }
 

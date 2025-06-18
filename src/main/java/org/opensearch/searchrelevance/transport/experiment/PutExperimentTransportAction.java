@@ -8,9 +8,6 @@
 package org.opensearch.searchrelevance.transport.experiment;
 
 import static org.opensearch.searchrelevance.common.MetricsConstants.PAIRWISE_FIELD_NAME_QUERY_TEXT;
-import static org.opensearch.searchrelevance.experiment.ExperimentOptionsForHybridSearch.EXPERIMENT_OPTION_COMBINATION_TECHNIQUE;
-import static org.opensearch.searchrelevance.experiment.ExperimentOptionsForHybridSearch.EXPERIMENT_OPTION_NORMALIZATION_TECHNIQUE;
-import static org.opensearch.searchrelevance.experiment.ExperimentOptionsForHybridSearch.EXPERIMENT_OPTION_WEIGHTS_FOR_COMBINATION;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -34,17 +31,15 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.searchrelevance.dao.ExperimentDao;
 import org.opensearch.searchrelevance.dao.ExperimentVariantDao;
+import org.opensearch.searchrelevance.dao.JudgmentDao;
 import org.opensearch.searchrelevance.dao.QuerySetDao;
 import org.opensearch.searchrelevance.dao.SearchConfigurationDao;
 import org.opensearch.searchrelevance.exception.SearchRelevanceException;
-import org.opensearch.searchrelevance.experiment.ExperimentOptionsFactory;
-import org.opensearch.searchrelevance.experiment.ExperimentOptionsForHybridSearch;
-import org.opensearch.searchrelevance.experiment.ExperimentVariantHybridSearchDTO;
-import org.opensearch.searchrelevance.metrics.MetricsHelper;
+import org.opensearch.searchrelevance.metrics.HybridSearchTaskManager;
+import org.opensearch.searchrelevance.metrics.MetricsHelperWithTaskQueue;
 import org.opensearch.searchrelevance.model.AsyncStatus;
 import org.opensearch.searchrelevance.model.Experiment;
 import org.opensearch.searchrelevance.model.ExperimentType;
-import org.opensearch.searchrelevance.model.ExperimentVariant;
 import org.opensearch.searchrelevance.model.QuerySet;
 import org.opensearch.searchrelevance.model.SearchConfiguration;
 import org.opensearch.searchrelevance.utils.TimeUtils;
@@ -61,7 +56,9 @@ public class PutExperimentTransportAction extends HandledTransportAction<PutExpe
     private final ExperimentVariantDao experimentVariantDao;
     private final QuerySetDao querySetDao;
     private final SearchConfigurationDao searchConfigurationDao;
-    private final MetricsHelper metricsHelper;
+    private final MetricsHelperWithTaskQueue metricsHelper;
+    private final HybridSearchTaskManager hybridSearchTaskManager;
+    private final HybridOptimizerTaskSupport hybridOptimizerTaskSupport;
 
     private static final Logger LOGGER = LogManager.getLogger(PutExperimentTransportAction.class);
 
@@ -74,7 +71,9 @@ public class PutExperimentTransportAction extends HandledTransportAction<PutExpe
         ExperimentVariantDao experimentVariantDao,
         QuerySetDao querySetDao,
         SearchConfigurationDao searchConfigurationDao,
-        MetricsHelper metricsHelper
+        MetricsHelperWithTaskQueue metricsHelper,
+        JudgmentDao judgmentDao,
+        HybridSearchTaskManager hybridSearchTaskManager
     ) {
         super(PutExperimentAction.NAME, transportService, actionFilters, PutExperimentRequest::new);
         this.clusterService = clusterService;
@@ -83,6 +82,8 @@ public class PutExperimentTransportAction extends HandledTransportAction<PutExpe
         this.querySetDao = querySetDao;
         this.searchConfigurationDao = searchConfigurationDao;
         this.metricsHelper = metricsHelper;
+        this.hybridSearchTaskManager = hybridSearchTaskManager;
+        this.hybridOptimizerTaskSupport = new HybridOptimizerTaskSupport(judgmentDao, experimentVariantDao, hybridSearchTaskManager);
     }
 
     @Override
@@ -191,6 +192,10 @@ public class PutExperimentTransportAction extends HandledTransportAction<PutExpe
         List<String> judgmentList
     ) {
         for (String queryText : queryTexts) {
+            if (hasFailure.get()) {
+                return;
+            }
+
             if (request.getType() == ExperimentType.PAIRWISE_COMPARISON) {
                 metricsHelper.processPairwiseMetrics(
                     queryText,
@@ -211,60 +216,29 @@ public class PutExperimentTransportAction extends HandledTransportAction<PutExpe
                     )
                 );
             } else if (request.getType() == ExperimentType.HYBRID_OPTIMIZER) {
-                Map<String, Object> defaultParametersForHybridSearch = ExperimentOptionsFactory
-                    .createDefaultExperimentParametersForHybridSearch();
-                ExperimentOptionsForHybridSearch experimentOptionForHybridSearch =
-                    (ExperimentOptionsForHybridSearch) ExperimentOptionsFactory.createExperimentOptions(
-                        ExperimentOptionsFactory.HYBRID_SEARCH_EXPERIMENT_OPTIONS,
-                        defaultParametersForHybridSearch
-                    );
-                List<ExperimentVariantHybridSearchDTO> experimentVariantDTOs = experimentOptionForHybridSearch.getParameterCombinations(
-                    true
-                );
-                List<ExperimentVariant> experimentVariants = new ArrayList<>();
-                for (ExperimentVariantHybridSearchDTO experimentVariantDTO : experimentVariantDTOs) {
-                    Map<String, Object> parameters = new HashMap<>(
-                        Map.of(
-                            EXPERIMENT_OPTION_NORMALIZATION_TECHNIQUE,
-                            experimentVariantDTO.getNormalizationTechnique(),
-                            EXPERIMENT_OPTION_COMBINATION_TECHNIQUE,
-                            experimentVariantDTO.getCombinationTechnique(),
-                            EXPERIMENT_OPTION_WEIGHTS_FOR_COMBINATION,
-                            experimentVariantDTO.getQueryWeightsForCombination()
-                        )
-                    );
-                    String experimentVariantId = UUID.randomUUID().toString();
-                    ExperimentVariant experimentVariant = new ExperimentVariant(
-                        experimentVariantId,
-                        TimeUtils.getTimestamp(),
-                        ExperimentType.HYBRID_OPTIMIZER,
-                        AsyncStatus.PROCESSING,
-                        experimentId,
-                        parameters,
-                        Map.of()
-                    );
-                    experimentVariants.add(experimentVariant);
-                    experimentVariantDao.putExperimentVariant(experimentVariant, ActionListener.wrap(response -> {}, e -> {}));
-                }
-                metricsHelper.processEvaluationMetrics(
+                // Use our task manager implementation for hybrid optimizer
+                hybridOptimizerTaskSupport.processHybridOptimizerExperiment(
+                    experimentId,
                     queryText,
                     indexAndQueries,
-                    request.getSize(),
                     judgmentList,
-                    ActionListener.wrap(queryResults -> {
-                        Map<String, Object> convertedResults = new HashMap<>(queryResults);
-                        handleQueryResults(
+                    request.getSize(),
+                    finalResults,
+                    pendingQueries,
+                    hasFailure,
+                    ActionListener.wrap(
+                        queryResults -> handleQueryResults(
                             queryText,
-                            convertedResults,
+                            queryResults,
                             finalResults,
                             pendingQueries,
                             experimentId,
                             request,
                             hasFailure,
                             judgmentList
-                        );
-                    }, error -> handleFailure(error, hasFailure, experimentId, request)),
-                    experimentVariants
+                        ),
+                        error -> handleFailure(error, hasFailure, experimentId, request)
+                    )
                 );
             } else if (request.getType() == ExperimentType.POINTWISE_EVALUATION) {
                 metricsHelper.processEvaluationMetrics(

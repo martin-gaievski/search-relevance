@@ -66,7 +66,8 @@ public class PostQuerySetTransportAction extends HandledTransportAction<PostQuer
 
         if (!checkUbiIndicesExist(clusterService)) {
             throw new SearchRelevanceException("UBI is not initialized", RestStatus.CONFLICT);
-        };
+        }
+        ;
 
         // Given sampling type and querySetSize, build the queryset accordingly
         String sampling = request.getSampling();

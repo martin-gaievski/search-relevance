@@ -77,6 +77,8 @@ public class BaseSearchRelevanceIT extends OpenSearchRestTestCase {
     private static final String INTERNAL_INDICES_PREFIX = ".";
     public static final String DEFAULT_USER_AGENT = "Kibana";
 
+    protected static final int DEFAULT_INTERVAL_MS = 2000;
+
     protected final ClassLoader classLoader = this.getClass().getClassLoader();
 
     @Before
