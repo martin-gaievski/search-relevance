@@ -7,7 +7,6 @@
  */
 package org.opensearch.searchrelevance.transport.experiment;
 
-import static org.opensearch.searchrelevance.common.MetricsConstants.POINTWISE_FIELD_NAME_EVALUATION_RESULTS;
 import static org.opensearch.searchrelevance.common.MetricsConstants.POINTWISE_FIELD_NAME_SEARCH_CONFIGURATION_ID;
 import static org.opensearch.searchrelevance.experiment.ExperimentOptionsForHybridSearch.EXPERIMENT_OPTION_COMBINATION_TECHNIQUE;
 import static org.opensearch.searchrelevance.experiment.ExperimentOptionsForHybridSearch.EXPERIMENT_OPTION_NORMALIZATION_TECHNIQUE;
@@ -238,6 +237,7 @@ public class HybridOptimizerTaskSupport {
     ) {
         // Count for search configurations
         AtomicInteger pendingConfigurations = new AtomicInteger(indexAndQueries.size());
+        List<Map<String, Object>> queryResults = Collections.synchronizedList(new ArrayList<>());
 
         // Process each search configuration
         for (Map.Entry<String, List<String>> entry : indexAndQueries.entrySet()) {
@@ -257,24 +257,29 @@ public class HybridOptimizerTaskSupport {
                 judgmentList,
                 docIdToScores,
                 hydratedResults,
-                new ActionListener<Map<String, Object>>() {
+                new ActionListener<>() {
                     @Override
                     public void onResponse(Map<String, Object> results) {
                         try {
-                            // Format results
-                            Map<String, Object> formattedResults = new HashMap<>();
-                            formattedResults.put(POINTWISE_FIELD_NAME_SEARCH_CONFIGURATION_ID, searchConfigId);
-                            formattedResults.put(POINTWISE_FIELD_NAME_EVALUATION_RESULTS, results.get("evaluationResults"));
+                            // Extract evaluation results and format them for the experiment
+                            List<Map<String, Object>> evaluationResults = (List<Map<String, Object>>) results.get("evaluationResults");
 
-                            synchronized (finalResults) {
-                                finalResults.add(formattedResults);
+                            synchronized (queryResults) {
+                                // Create one result entry for this search configuration with all evaluation results
+                                if (evaluationResults != null && !evaluationResults.isEmpty()) {
+                                    Map<String, Object> searchConfigResult = new HashMap<>();
+                                    searchConfigResult.put(POINTWISE_FIELD_NAME_SEARCH_CONFIGURATION_ID, searchConfigId);
+                                    searchConfigResult.put("evaluationResults", new ArrayList<>(evaluationResults));
+                                    // queryText will be added by handleQueryResults
+                                    queryResults.add(searchConfigResult);
+                                }
 
                                 // Check if all search configurations for this query are complete
                                 if (pendingConfigurations.decrementAndGet() == 0) {
-                                    // Mark query as complete
-                                    if (pendingQueries.decrementAndGet() == 0) {
-                                        finalListener.onResponse(new HashMap<>(hydratedResults));
-                                    }
+                                    // All search configurations processed, return results for this query
+                                    Map<String, Object> queryResponse = new HashMap<>();
+                                    queryResponse.put("searchConfigurationResults", new ArrayList<>(queryResults));
+                                    finalListener.onResponse(queryResponse);
                                 }
                             }
                         } catch (Exception e) {

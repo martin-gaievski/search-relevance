@@ -72,7 +72,7 @@ public class ExperimentIT extends BaseSearchRelevanceIT {
     // Expected number of variants per query for HYBRID_OPTIMIZER experiments
     private static final int EXPECTED_VARIANTS_PER_QUERY = 66;
     // Timeout values
-    private static final int MAX_POLL_RETRIES = 15;
+    private static final int MAX_POLL_RETRIES = 60;
 
     @SneakyThrows
     public void testPointwiseEvaluationExperiment_whenQueryWithPlaceholder_thenSuccessful() {
@@ -110,26 +110,38 @@ public class ExperimentIT extends BaseSearchRelevanceIT {
             String experimentId = createHybridOptimizerExperiment(querySetId, hybridSearchConfigId, judgmentId);
 
             // Wait for the experiment to be created and indexed
-            Thread.sleep(5000);
+            Thread.sleep(DEFAULT_INTERVAL_MS);
+
+            Map<String, Object> experimentSource = pollExperimentUntilCompleted(experimentId);
 
             // Assert experiment exists with correct type
             // We don't wait for completion since it may time out in constrained environments
-            Map<String, Object> experimentSource = getExperiment(experimentId);
+            // Map<String, Object> experimentSource = getExperiment(experimentId);
             assertNotNull("Experiment should exist", experimentSource);
             assertEquals("HYBRID_OPTIMIZER", experimentSource.get("type"));
             assertEquals(querySetId, experimentSource.get("querySetId"));
 
+            // refresh indexes to make sure data is propagated
+            makeRequest(
+                client(),
+                RestRequest.Method.POST.name(),
+                EXPERIMENT_VARIANT_INDEX + "/_refresh",
+                null,
+                null,
+                ImmutableList.of(new BasicHeader(HttpHeaders.USER_AGENT, DEFAULT_USER_AGENT))
+            );
+
+            makeRequest(
+                client(),
+                RestRequest.Method.POST.name(),
+                EVALUATION_RESULT_INDEX + "/_refresh",
+                null,
+                null,
+                ImmutableList.of(new BasicHeader(HttpHeaders.USER_AGENT, DEFAULT_USER_AGENT))
+            );
             // If experiment completed, try to verify variants for a well-known query
-            // This is a best-effort verification that may be skipped if resources are constrained
-            if ("COMPLETED".equals(experimentSource.get("status"))) {
-                try {
-                    // Use a query we know has judgments
-                    String sampleQueryTerm = "button"; // Known to have judgments
-                    assertHybridOptimizerExperimentVariantsForQuery(experimentId, sampleQueryTerm);
-                } catch (Exception e) {
-                    // Log but don't fail the test if variant verification fails
-                    logger.error("Couldn't retrieve judgements for query text", e);
-                }
+            for (String sampleQueryTerm : EXPECTED_QUERY_TERMS) {
+                assertHybridOptimizerExperimentVariantsForQuery(experimentId, sampleQueryTerm);
             }
         } finally {
             deleteIndex(INDEX_NAME_ESCI);
@@ -248,14 +260,18 @@ public class ExperimentIT extends BaseSearchRelevanceIT {
         // We should have found some evaluation results
         assertFalse("Should have evaluation results for query: " + queryText, evaluationIds.isEmpty());
 
-        // Now get the experiment variants that reference these evaluation result IDs
-        List<Map<String, Object>> variants = getExperimentVariantsForEvaluationIds(experimentId, evaluationIds);
+        // Poll for experiment variants until we have the expected number or reach max retries
+        List<Map<String, Object>> variants = pollForExperimentVariants(experimentId, evaluationIds, queryText);
 
         // We should have found some experiment variants
         assertFalse("Should have experiment variants for query: " + queryText, variants.isEmpty());
 
         // We should have multiple variants for the query
-        assertEquals(EXPECTED_VARIANTS_PER_QUERY, variants.size());
+        assertEquals(
+            "Expected " + EXPECTED_VARIANTS_PER_QUERY + " variants for query: " + queryText,
+            EXPECTED_VARIANTS_PER_QUERY,
+            variants.size()
+        );
 
         // Verify structure of a few variants
         int variantsToCheck = Math.min(3, variants.size());
@@ -282,6 +298,50 @@ public class ExperimentIT extends BaseSearchRelevanceIT {
             // Verify the evaluation result exists and has the correct query text
             verifyEvaluationResult(evaluationResultId, queryText);
         }
+    }
+
+    /**
+     * Poll for experiment variants until we have the expected number or reach max retries
+     */
+    private List<Map<String, Object>> pollForExperimentVariants(String experimentId, List<String> evaluationIds, String queryText)
+        throws IOException {
+        List<Map<String, Object>> variants = new ArrayList<>();
+        int retryCount = 0;
+
+        while (variants.size() < EXPECTED_VARIANTS_PER_QUERY && retryCount < MAX_POLL_RETRIES) {
+            // Get the current experiment variants
+            variants = getExperimentVariantsForEvaluationIds(experimentId, evaluationIds);
+
+            if (variants.size() >= EXPECTED_VARIANTS_PER_QUERY) {
+                // We have enough variants, break out of the loop
+                break;
+            }
+
+            retryCount++;
+            try {
+                Thread.sleep(DEFAULT_INTERVAL_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+
+        // If we reached max polling iterations and still don't have enough variants, fail the test
+        if (variants.size() < EXPECTED_VARIANTS_PER_QUERY && retryCount >= MAX_POLL_RETRIES) {
+            fail(
+                "Expected "
+                    + EXPECTED_VARIANTS_PER_QUERY
+                    + " variants for query '"
+                    + queryText
+                    + "' but only found "
+                    + variants.size()
+                    + " after "
+                    + MAX_POLL_RETRIES
+                    + " polling attempts"
+            );
+        }
+
+        return variants;
     }
 
     private List<String> getEvaluationResultIdsForQuery(String queryText) throws IOException {
@@ -447,7 +507,7 @@ public class ExperimentIT extends BaseSearchRelevanceIT {
 
         while (("PROCESSING".equals(status) || status == null) && retryCount < MAX_POLL_RETRIES) {
             Response getExperimentResponse = makeRequest(
-                client(),
+                adminClient(),
                 RestRequest.Method.GET.name(),
                 getExperimentByIdUrl,
                 null,
@@ -470,38 +530,13 @@ public class ExperimentIT extends BaseSearchRelevanceIT {
                     Thread.currentThread().interrupt();
                     break;
                 }
+            } else {
+                assertEquals("COMPLETED", status);
             }
         }
 
         // Assert that we have a valid experiment status
-        assertNotNull("Experiment status should not be null", status);
-
-        // Refresh all related indices to ensure documents are available for search
-        makeRequest(
-            client(),
-            RestRequest.Method.POST.name(),
-            EXPERIMENT_VARIANT_INDEX + "/_refresh",
-            null,
-            null,
-            ImmutableList.of(new BasicHeader(HttpHeaders.USER_AGENT, DEFAULT_USER_AGENT))
-        );
-
-        makeRequest(
-            client(),
-            RestRequest.Method.POST.name(),
-            EVALUATION_RESULT_INDEX + "/_refresh",
-            null,
-            null,
-            ImmutableList.of(new BasicHeader(HttpHeaders.USER_AGENT, DEFAULT_USER_AGENT))
-        );
-
-        // Add delay to ensure data propagation
-        try {
-            Thread.sleep(DEFAULT_INTERVAL_MS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
-
+        assertEquals("Experiment status must be COMPLETED", "COMPLETED", status);
         return source;
     }
 
@@ -546,6 +581,10 @@ public class ExperimentIT extends BaseSearchRelevanceIT {
         String experimentId = createExperimentResultJson.get("experiment_id").toString();
         assertNotNull(experimentId);
         assertEquals("CREATED", createExperimentResultJson.get("experiment_result").toString());
+
+        // Refresh all related indices to ensure documents are available for search
+        Thread.sleep(DEFAULT_INTERVAL_MS);
+
         return experimentId;
     }
 

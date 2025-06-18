@@ -14,6 +14,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -27,6 +28,7 @@ import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.AbstractRunnable;
 import org.opensearch.common.util.concurrent.ThreadContext;
@@ -43,13 +45,21 @@ import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
 
 /**
- * Task manager for efficiently handling hybrid optimizer search tasks
+ * Task manager for efficiently handling hybrid optimizer search tasks with concurrency control
  */
 public class HybridSearchTaskManager {
     private static final Logger log = LogManager.getLogger(HybridSearchTaskManager.class);
 
+    // Concurrency control settings
+    public static final int MAX_CONCURRENT_HYBRID_SEARCH_TASKS = 16;
+
+    public static final int TASK_RETRY_DELAY_MILLISECONDS = 2000;
+
     // Task completion tracking
     private final Map<String, TaskContext> experimentTaskContexts = new HashMap<>();
+
+    // Concurrency control
+    private final Semaphore concurrencyControl;
 
     // Services
     private final Client client;
@@ -64,17 +74,27 @@ public class HybridSearchTaskManager {
         ClusterService clusterService,
         EvaluationResultDao evaluationResultDao,
         ExperimentVariantDao experimentVariantDao,
-        ThreadPool threadPool
+        ThreadPool threadPool,
+        Settings settings
     ) {
         this.client = client;
         this.clusterService = clusterService;
         this.evaluationResultDao = evaluationResultDao;
         this.experimentVariantDao = experimentVariantDao;
         this.threadPool = threadPool;
+
+        // Initialize concurrency control based on settings
+        this.concurrencyControl = new Semaphore(MAX_CONCURRENT_HYBRID_SEARCH_TASKS, true); // Fair ordering
+
+        log.info(
+            "HybridSearchTaskManager initialized with max {} concurrent tasks, {} second retry delay",
+                MAX_CONCURRENT_HYBRID_SEARCH_TASKS,
+                TASK_RETRY_DELAY_MILLISECONDS
+        );
     }
 
     /**
-     * Schedule hybrid search tasks for execution through the managed thread pool
+     * Schedule hybrid search tasks for execution with concurrency control
      *
      * @param experimentId The experiment identifier
      * @param searchConfigId The search configuration identifier
@@ -126,7 +146,9 @@ public class HybridSearchTaskManager {
             }
         }
 
-        // Schedule each experiment variant as a separate task
+        log.info("Scheduling {} hybrid search tasks for experiment {} with concurrency control", experimentVariants.size(), experimentId);
+
+        // Schedule each experiment variant as a separate task with concurrency control
         for (ExperimentVariant experimentVariant : experimentVariants) {
             scheduleVariantTask(
                 experimentId,
@@ -144,9 +166,107 @@ public class HybridSearchTaskManager {
     }
 
     /**
-     * Schedule a single variant task for execution
+     * Schedule a single variant task for execution with concurrency control
      */
     private void scheduleVariantTask(
+        String experimentId,
+        String searchConfigId,
+        String index,
+        String query,
+        String queryText,
+        int size,
+        ExperimentVariant experimentVariant,
+        List<String> judgmentIds,
+        Map<String, String> docIdToScores,
+        TaskContext taskContext
+    ) {
+        // Use OpenSearch's thread pool to manage task scheduling (non-blocking)
+        threadPool.executor(ThreadPool.Names.GENERIC).execute(new AbstractRunnable() {
+            @Override
+            public void onFailure(Exception e) {
+                handleTaskFailure(experimentVariant, e, taskContext);
+            }
+
+            @Override
+            protected void doRun() throws Exception {
+                // Try to acquire a permit for concurrency control
+                if (concurrencyControl.tryAcquire()) {
+                    try {
+                        // Execute the task immediately if permit is available
+                        executeVariantTaskWithPermit(
+                            experimentId,
+                            searchConfigId,
+                            index,
+                            query,
+                            queryText,
+                            size,
+                            experimentVariant,
+                            judgmentIds,
+                            docIdToScores,
+                            taskContext
+                        );
+                    } catch (Exception e) {
+                        // Always release the permit in case of exception
+                        concurrencyControl.release();
+                        throw e;
+                    }
+                } else {
+                    // No permit available - schedule with backpressure
+                    scheduleWithBackpressure(
+                        experimentId,
+                        searchConfigId,
+                        index,
+                        query,
+                        queryText,
+                        size,
+                        experimentVariant,
+                        judgmentIds,
+                        docIdToScores,
+                        taskContext
+                    );
+                }
+            }
+        });
+    }
+
+    /**
+     * Schedule task with backpressure when concurrency limit is reached
+     */
+    private void scheduleWithBackpressure(
+        String experimentId,
+        String searchConfigId,
+        String index,
+        String query,
+        String queryText,
+        int size,
+        ExperimentVariant experimentVariant,
+        List<String> judgmentIds,
+        Map<String, String> docIdToScores,
+        TaskContext taskContext
+    ) {
+        log.debug("Concurrency limit reached. Scheduling task with backpressure for variant: {}", experimentVariant.getId());
+
+        // Schedule retry after delay
+        threadPool.schedule(() -> {
+            scheduleVariantTask(
+                experimentId,
+                searchConfigId,
+                index,
+                query,
+                queryText,
+                size,
+                experimentVariant,
+                judgmentIds,
+                docIdToScores,
+                taskContext
+            );
+        }, new TimeValue(TASK_RETRY_DELAY_MILLISECONDS, TimeUnit.MILLISECONDS), ThreadPool.Names.GENERIC);
+    }
+
+    /**
+     * Execute the variant task with acquired permit
+     */
+    private void executeVariantTaskWithPermit(
         String experimentId,
         String searchConfigId,
         String index,
@@ -162,41 +282,13 @@ public class HybridSearchTaskManager {
         ThreadContext.StoredContext storedContext = threadPool.getThreadContext().newStoredContext(true);
 
         try {
-            // Use OpenSearch's thread pool instead of a custom executor
-            threadPool.executor(ThreadPool.Names.SEARCH).execute(new AbstractRunnable() {
-                @Override
-                public void onFailure(Exception e) {
-                    handleTaskFailure(experimentVariant, e, taskContext);
-                }
+            storedContext.restore();
 
-                @Override
-                protected void doRun() throws Exception {
-                    try {
-                        storedContext.restore();
+            if (taskContext.hasFailure.get()) {
+                return;
+            }
 
-                        if (taskContext.hasFailure.get()) return;
-
-                        executeVariantTask(
-                            experimentId,
-                            searchConfigId,
-                            index,
-                            query,
-                            queryText,
-                            size,
-                            experimentVariant,
-                            judgmentIds,
-                            docIdToScores,
-                            taskContext
-                        );
-                    } finally {
-                        storedContext.close();
-                    }
-                }
-            });
-        } catch (Exception e) {
-            // Handle task rejection by retrying after delay using OpenSearch's scheduled executor
-            log.warn("Task rejected. Will retry after delay: {}", e.getMessage());
-            retryTaskAfterDelay(
+            executeVariantTask(
                 experimentId,
                 searchConfigId,
                 index,
@@ -208,39 +300,9 @@ public class HybridSearchTaskManager {
                 docIdToScores,
                 taskContext
             );
+        } finally {
+            storedContext.close();
         }
-    }
-
-    /**
-     * Retry a task after a delay
-     */
-    private void retryTaskAfterDelay(
-        String experimentId,
-        String searchConfigId,
-        String index,
-        String query,
-        String queryText,
-        int size,
-        ExperimentVariant experimentVariant,
-        List<String> judgmentIds,
-        Map<String, String> docIdToScores,
-        TaskContext taskContext
-    ) {
-        // Use OpenSearch's thread pool for scheduling delayed tasks
-        threadPool.schedule(() -> {
-            scheduleVariantTask(
-                experimentId,
-                searchConfigId,
-                index,
-                query,
-                queryText,
-                size,
-                experimentVariant,
-                judgmentIds,
-                docIdToScores,
-                taskContext
-            );
-        }, new TimeValue(1, TimeUnit.SECONDS), ThreadPool.Names.GENERIC);
     }
 
     /**
@@ -258,7 +320,10 @@ public class HybridSearchTaskManager {
         Map<String, String> docIdToScores,
         TaskContext taskContext
     ) {
-        if (taskContext.hasFailure.get()) return;
+        if (taskContext.hasFailure.get()) {
+            concurrencyControl.release();
+            return;
+        }
 
         final String evaluationId = UUID.randomUUID().toString();
         Map<String, Object> temporarySearchPipeline = org.opensearch.searchrelevance.experiment.QuerySourceUtil
@@ -281,10 +346,9 @@ public class HybridSearchTaskManager {
             evaluationId
         );
 
-        client.search(
-            searchRequest,
-            ActionListener.wrap(
-                response -> processSearchResponse(
+        client.search(searchRequest, ActionListener.wrap(response -> {
+            try {
+                processSearchResponse(
                     response,
                     experimentVariant,
                     experimentId,
@@ -295,10 +359,19 @@ public class HybridSearchTaskManager {
                     docIdToScores,
                     evaluationId,
                     taskContext
-                ),
-                exception -> handleSearchFailure(exception, experimentVariant, experimentId, evaluationId, taskContext)
-            )
-        );
+                );
+            } finally {
+                // Always release the permit after processing
+                concurrencyControl.release();
+            }
+        }, exception -> {
+            try {
+                handleSearchFailure(exception, experimentVariant, experimentId, evaluationId, taskContext);
+            } finally {
+                // Always release the permit after processing
+                concurrencyControl.release();
+            }
+        }));
     }
 
     /**
@@ -421,6 +494,17 @@ public class HybridSearchTaskManager {
     }
 
     /**
+     * Get current concurrency metrics for monitoring
+     */
+    public Map<String, Object> getConcurrencyMetrics() {
+        Map<String, Object> metrics = new HashMap<>();
+        metrics.put("available_permits", concurrencyControl.availablePermits());
+        metrics.put("queued_threads", concurrencyControl.getQueueLength());
+        metrics.put("active_experiments", experimentTaskContexts.size());
+        return metrics;
+    }
+
+    /**
      * Context for tracking tasks for a specific experiment
      */
     private class TaskContext {
@@ -456,20 +540,18 @@ public class HybridSearchTaskManager {
         public void completeVariant() {
             if (remainingVariants.decrementAndGet() == 0) {
                 // All variants for this search configuration are complete
-                if (pendingConfigurations.decrementAndGet() == 0) {
-                    // All search configurations are complete, format results and notify listener
-                    Map<String, Object> transformedConfigToExperimentVariants = new HashMap<>();
-                    transformedConfigToExperimentVariants.put("searchConfigurationId", searchConfigId);
+                // Format results and notify listener for this search configuration
+                Map<String, Object> transformedConfigToExperimentVariants = new HashMap<>();
+                transformedConfigToExperimentVariants.put("searchConfigurationId", searchConfigId);
 
-                    List<Map<String, Object>> evaluationResults = formatEvaluationResults();
-                    transformedConfigToExperimentVariants.put("evaluationResults", evaluationResults);
+                List<Map<String, Object>> evaluationResults = formatEvaluationResults();
+                transformedConfigToExperimentVariants.put("evaluationResults", evaluationResults);
 
-                    finalListener.onResponse(transformedConfigToExperimentVariants);
+                finalListener.onResponse(transformedConfigToExperimentVariants);
 
-                    // Clean up this task context
-                    synchronized (experimentTaskContexts) {
-                        experimentTaskContexts.remove(experimentId);
-                    }
+                // Clean up this task context
+                synchronized (experimentTaskContexts) {
+                    experimentTaskContexts.remove(experimentId);
                 }
             }
         }
