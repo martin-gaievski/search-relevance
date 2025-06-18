@@ -50,7 +50,8 @@ import org.opensearch.searchrelevance.dao.JudgmentDao;
 import org.opensearch.searchrelevance.dao.QuerySetDao;
 import org.opensearch.searchrelevance.dao.SearchConfigurationDao;
 import org.opensearch.searchrelevance.indices.SearchRelevanceIndicesManager;
-import org.opensearch.searchrelevance.metrics.MetricsHelper;
+import org.opensearch.searchrelevance.metrics.HybridSearchTaskManager;
+import org.opensearch.searchrelevance.metrics.MetricsHelperWithTaskQueue;
 import org.opensearch.searchrelevance.ml.MLAccessor;
 import org.opensearch.searchrelevance.rest.RestCreateQuerySetAction;
 import org.opensearch.searchrelevance.rest.RestDeleteExperimentAction;
@@ -118,7 +119,7 @@ public class SearchRelevancePlugin extends Plugin implements ActionPlugin, Syste
     private EvaluationResultDao evaluationResultDao;
     private JudgmentCacheDao judgmentCacheDao;
     private MLAccessor mlAccessor;
-    private MetricsHelper metricsHelper;
+    private MetricsHelperWithTaskQueue metricsHelper;
     private SearchRelevanceSettingsAccessor settingsAccessor;
     private ClusterUtil clusterUtil;
     private InfoStatsManager infoStatsManager;
@@ -157,7 +158,26 @@ public class SearchRelevancePlugin extends Plugin implements ActionPlugin, Syste
         this.judgmentCacheDao = new JudgmentCacheDao(searchRelevanceIndicesManager);
         MachineLearningNodeClient mlClient = new MachineLearningNodeClient(client);
         this.mlAccessor = new MLAccessor(mlClient);
-        this.metricsHelper = new MetricsHelper(clusterService, client, judgmentDao, evaluationResultDao, experimentVariantDao);
+
+        // Create HybridSearchTaskManager first
+        HybridSearchTaskManager hybridSearchTaskManager = new HybridSearchTaskManager(
+            client,
+            clusterService,
+            evaluationResultDao,
+            experimentVariantDao,
+            threadPool
+        );
+
+        // Use MetricsHelperWithTaskQueue instead of MetricsHelper
+        this.metricsHelper = new MetricsHelperWithTaskQueue(
+            clusterService,
+            client,
+            judgmentDao,
+            evaluationResultDao,
+            experimentVariantDao,
+            hybridSearchTaskManager
+        );
+
         this.settingsAccessor = new SearchRelevanceSettingsAccessor(clusterService, environment.settings());
         this.clusterUtil = new ClusterUtil(clusterService);
         this.infoStatsManager = new InfoStatsManager(settingsAccessor);
@@ -174,7 +194,8 @@ public class SearchRelevancePlugin extends Plugin implements ActionPlugin, Syste
             judgmentCacheDao,
             mlAccessor,
             metricsHelper,
-            infoStatsManager
+            infoStatsManager,
+            hybridSearchTaskManager
         );
     }
 
