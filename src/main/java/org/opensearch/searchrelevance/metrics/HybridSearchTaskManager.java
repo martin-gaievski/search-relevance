@@ -26,9 +26,7 @@ import org.opensearch.action.StepListener;
 import org.opensearch.action.index.IndexResponse;
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchResponse;
-import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
-import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.AbstractRunnable;
 import org.opensearch.common.util.concurrent.ThreadContext;
@@ -63,7 +61,6 @@ public class HybridSearchTaskManager {
 
     // Services
     private final Client client;
-    private final ClusterService clusterService;
     private final EvaluationResultDao evaluationResultDao;
     private final ExperimentVariantDao experimentVariantDao;
     private final ThreadPool threadPool;
@@ -71,14 +68,11 @@ public class HybridSearchTaskManager {
     @Inject
     public HybridSearchTaskManager(
         Client client,
-        ClusterService clusterService,
         EvaluationResultDao evaluationResultDao,
         ExperimentVariantDao experimentVariantDao,
-        ThreadPool threadPool,
-        Settings settings
+        ThreadPool threadPool
     ) {
         this.client = client;
-        this.clusterService = clusterService;
         this.evaluationResultDao = evaluationResultDao;
         this.experimentVariantDao = experimentVariantDao;
         this.threadPool = threadPool;
@@ -88,8 +82,8 @@ public class HybridSearchTaskManager {
 
         log.info(
             "HybridSearchTaskManager initialized with max {} concurrent tasks, {} second retry delay",
-                MAX_CONCURRENT_HYBRID_SEARCH_TASKS,
-                TASK_RETRY_DELAY_MILLISECONDS
+            MAX_CONCURRENT_HYBRID_SEARCH_TASKS,
+            TASK_RETRY_DELAY_MILLISECONDS
         );
     }
 

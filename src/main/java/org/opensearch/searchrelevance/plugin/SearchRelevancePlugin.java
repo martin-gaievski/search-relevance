@@ -162,11 +162,9 @@ public class SearchRelevancePlugin extends Plugin implements ActionPlugin, Syste
         // Create HybridSearchTaskManager with settings for concurrency control
         HybridSearchTaskManager hybridSearchTaskManager = new HybridSearchTaskManager(
             client,
-            clusterService,
             evaluationResultDao,
             experimentVariantDao,
-            threadPool,
-            environment.settings()
+            threadPool
         );
 
         // Use base MetricsHelper class
@@ -243,10 +241,6 @@ public class SearchRelevancePlugin extends Plugin implements ActionPlugin, Syste
 
     @Override
     public List<Setting<?>> getSettings() {
-        return List.of(
-            SEARCH_RELEVANCE_WORKBENCH_ENABLED,
-            SEARCH_RELEVANCE_STATS_ENABLED,
-            SEARCH_RELEVANCE_QUERY_SET_MAX_LIMIT
-        );
+        return List.of(SEARCH_RELEVANCE_WORKBENCH_ENABLED, SEARCH_RELEVANCE_STATS_ENABLED, SEARCH_RELEVANCE_QUERY_SET_MAX_LIMIT);
     }
 }
