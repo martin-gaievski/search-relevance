@@ -89,18 +89,15 @@ ext {
     licenseFile = rootProject.file('LICENSE.txt')
     noticeFile = rootProject.file('NOTICE.txt')
 
-    runIntegTestWithSecurityPlugin= System.getProperty("security.enabled")
-    if (runIntegTestWithSecurityPlugin == "true"){
-        ['esnode.pem', 'esnode-key.pem', 'kirk.pem', 'kirk-key.pem', 'root-ca.pem', 'sample.pem', 'test-kirk.jks'].forEach { file ->
-            File local = getLayout().getBuildDirectory().file(file).get().getAsFile()
-            download.run {
-                src "https://raw.githubusercontent.com/opensearch-project/security/refs/heads/main/bwc-test/src/test/resources/security/" + file
-                dest local
-                overwrite false
-            }
-            processTestResources {
-                from(local)
-            }
+    ['esnode.pem', 'esnode-key.pem', 'kirk.pem', 'kirk-key.pem', 'root-ca.pem', 'sample.pem', 'test-kirk.jks'].forEach { file ->
+        File local = getLayout().getBuildDirectory().file(file).get().getAsFile()
+        download.run {
+            src "https://raw.githubusercontent.com/opensearch-project/security/refs/heads/main/bwc-test/src/test/resources/security/" + file
+            dest local
+            overwrite false
+        }
+        processTestResources {
+            from(local)
         }
     }
 }
@@ -296,7 +293,7 @@ def securityPluginFile = resolvePluginFile("opensearch-security")
 
 // === Setup security test ===
 // This flag indicates the existence of security plugin
-def securityEnabled = System.getProperty("security.enabled", "false") == "true"
+def securityEnabled = System.getProperty("security.enabled", "false") == "true" || System.getProperty("security", "false") == "true" || System.getProperty("https", "false") == "true"
 
 // Set up integration test clusters, installs all zipArchive dependencies and Flow Framework
 testClusters.integTest {
