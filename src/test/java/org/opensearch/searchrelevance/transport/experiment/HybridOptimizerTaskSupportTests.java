@@ -25,7 +25,7 @@ import org.opensearch.action.search.SearchResponse;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.searchrelevance.dao.ExperimentVariantDao;
 import org.opensearch.searchrelevance.dao.JudgmentDao;
-import org.opensearch.searchrelevance.metrics.HybridSearchTaskManager;
+import org.opensearch.searchrelevance.executors.HybridSearchTaskManager;
 import org.opensearch.test.OpenSearchTestCase;
 
 /**

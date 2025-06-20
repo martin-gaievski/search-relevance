@@ -22,25 +22,25 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.searchrelevance.dao.ExperimentVariantDao;
 import org.opensearch.searchrelevance.dao.JudgmentDao;
+import org.opensearch.searchrelevance.executors.HybridSearchTaskManager;
 import org.opensearch.searchrelevance.experiment.ExperimentOptionsFactory;
 import org.opensearch.searchrelevance.experiment.ExperimentOptionsForHybridSearch;
 import org.opensearch.searchrelevance.experiment.ExperimentVariantHybridSearchDTO;
-import org.opensearch.searchrelevance.metrics.HybridSearchTaskManager;
 import org.opensearch.searchrelevance.model.AsyncStatus;
 import org.opensearch.searchrelevance.model.ExperimentType;
 import org.opensearch.searchrelevance.model.ExperimentVariant;
 import org.opensearch.searchrelevance.utils.TimeUtils;
 
+import lombok.extern.log4j.Log4j2;
+
 /**
  * Support class for handling HYBRID_OPTIMIZER experiments with task queue
  */
+@Log4j2
 public class HybridOptimizerTaskSupport {
-    private static final Logger log = LogManager.getLogger(HybridOptimizerTaskSupport.class);
 
     private final JudgmentDao judgmentDao;
     private final ExperimentVariantDao experimentVariantDao;
