@@ -22,6 +22,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import org.opensearch.action.search.SearchResponse;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.searchrelevance.dao.ExperimentVariantDao;
 import org.opensearch.searchrelevance.dao.JudgmentDao;
@@ -37,16 +38,16 @@ import org.opensearch.searchrelevance.utils.TimeUtils;
 import lombok.extern.log4j.Log4j2;
 
 /**
- * Support class for handling HYBRID_OPTIMIZER experiments with task queue
+ * Processor for handling HYBRID_OPTIMIZER experiments with asynchronous task management
  */
 @Log4j2
-public class HybridOptimizerTaskSupport {
+public class HybridOptimizerExperimentProcessor {
 
     private final JudgmentDao judgmentDao;
     private final ExperimentVariantDao experimentVariantDao;
     private final HybridSearchTaskManager taskManager;
 
-    public HybridOptimizerTaskSupport(
+    public HybridOptimizerExperimentProcessor(
         JudgmentDao judgmentDao,
         ExperimentVariantDao experimentVariantDao,
         HybridSearchTaskManager taskManager
@@ -88,8 +89,24 @@ public class HybridOptimizerTaskSupport {
         List<ExperimentVariantHybridSearchDTO> experimentVariantDTOs = experimentOptionForHybridSearch.getParameterCombinations(true);
         List<ExperimentVariant> experimentVariants = new ArrayList<>();
 
+        log.info(
+            "Starting hybrid optimizer experiment {} with {} parameter combinations for query: {}",
+            experimentId,
+            experimentVariantDTOs.size(),
+            queryText
+        );
+
+        // Log completion of variant creation
+        log.info(
+            "Experiment {}: Created all {} experiment variants, proceeding to judgment processing",
+            experimentId,
+            experimentVariantDTOs.size()
+        );
+
         // Create experiment variants
-        for (ExperimentVariantHybridSearchDTO experimentVariantDTO : experimentVariantDTOs) {
+        for (int experimentVariantIndex = 0; experimentVariantIndex < experimentVariantDTOs.size(); experimentVariantIndex++) {
+            ExperimentVariantHybridSearchDTO experimentVariantDTO = experimentVariantDTOs.get(experimentVariantIndex);
+            final int currentIndex = experimentVariantIndex;
             Map<String, Object> parameters = new HashMap<>(
                 Map.of(
                     EXPERIMENT_OPTION_NORMALIZATION_TECHNIQUE,
@@ -113,52 +130,109 @@ public class HybridOptimizerTaskSupport {
             experimentVariants.add(experimentVariant);
 
             // Store experiment variant
-            experimentVariantDao.putExperimentVariant(
-                experimentVariant,
-                ActionListener.wrap(
-                    success -> log.debug("Created experiment variant: {}", experimentVariantId),
-                    error -> log.error("Failed to create experiment variant: {}", experimentVariantId, error)
-                )
-            );
+            experimentVariantDao.putExperimentVariant(experimentVariant, ActionListener.wrap(success -> {
+                log.debug("Created experiment variant: {}", experimentVariantId);
+                // Log progress every 1000 variants
+                if (currentIndex % 1000 == 0) {
+                    log.info(
+                        "Experiment {}: Created {} of {} experiment variants",
+                        experimentId,
+                        currentIndex + 1,
+                        experimentVariantDTOs.size()
+                    );
+                }
+            }, error -> log.error("Failed to create experiment variant: {}", experimentVariantId, error)));
         }
 
         // Process experiment variants for each search configuration
         Map<String, Object> hydratedResults = new ConcurrentHashMap<>();
 
-        // Get document scores from judgments
-        processJudgments(queryText, judgmentList, new ActionListener<Map<String, String>>() {
-            @Override
-            public void onResponse(Map<String, String> docIdToScores) {
-                // Process search configurations with our task manager
-                processSearchConfigurations(
-                    experimentId,
-                    queryText,
-                    indexAndQueries,
-                    judgmentList,
-                    size,
-                    experimentVariants,
-                    docIdToScores,
-                    hydratedResults,
-                    finalResults,
-                    pendingQueries,
-                    hasFailure,
-                    listener
-                );
+        try {
+            // Get document scores from judgments synchronously
+            List<SearchResponse> judgmentResponses = new ArrayList<>();
+            for (String judgmentId : judgmentList) {
+                SearchResponse judgmentResponse = judgmentDao.getJudgmentSync(judgmentId);
+                judgmentResponses.add(judgmentResponse);
             }
 
-            @Override
-            public void onFailure(Exception e) {
-                if (hasFailure.compareAndSet(false, true)) {
-                    listener.onFailure(e);
-                }
+            Map<String, String> docIdToScores = processJudgments(queryText, judgmentResponses);
+
+            // Continue processing even if no ratings found - this is expected for some queries
+            log.info("Processing search configurations for query '{}' with {} document ratings", queryText, docIdToScores.size());
+
+            // Process search configurations with our task manager
+            processSearchConfigurations(
+                experimentId,
+                queryText,
+                indexAndQueries,
+                judgmentList,
+                size,
+                experimentVariants,
+                docIdToScores,
+                hydratedResults,
+                finalResults,
+                pendingQueries,
+                hasFailure,
+                listener
+            );
+        } catch (Exception e) {
+            if (hasFailure.compareAndSet(false, true)) {
+                listener.onFailure(e);
             }
-        });
+        }
     }
 
     /**
-     * Process judgments to extract document scores
+     * Process judgments to extract document scores from SearchResponse objects (synchronous)
+     */
+    private Map<String, String> processJudgments(String queryText, List<SearchResponse> judgmentResponses) {
+        log.info("Processing {} judgment responses for query: {}", judgmentResponses.size(), queryText);
+
+        Map<String, String> docIdToScores = new HashMap<>();
+
+        for (SearchResponse judgmentResponse : judgmentResponses) {
+            try {
+                if (judgmentResponse.getHits().getTotalHits().value() == 0) {
+                    log.warn("No judgment found in response");
+                } else {
+                    Map<String, Object> sourceAsMap = judgmentResponse.getHits().getHits()[0].getSourceAsMap();
+                    List<Map<String, Object>> judgmentRatings = (List<Map<String, Object>>) sourceAsMap.getOrDefault(
+                        "judgmentRatings",
+                        Collections.emptyList()
+                    );
+
+                    for (Map<String, Object> rating : judgmentRatings) {
+                        if (queryText.equals(rating.get("query"))) {
+                            List<Map<String, String>> docScoreRatings = (List<Map<String, String>>) rating.get("ratings");
+                            if (docScoreRatings != null) {
+                                docScoreRatings.forEach(
+                                    docScoreRating -> docIdToScores.put(docScoreRating.get("docId"), docScoreRating.get("rating"))
+                                );
+                            }
+                            break;
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                log.error("Failed to process judgment response: {}", e.getMessage());
+            }
+        }
+
+        if (docIdToScores.isEmpty()) {
+            log.warn("No ratings found for query: {} in any judgment responses", queryText);
+        } else {
+            log.info("Found {} document ratings for query: {}", docIdToScores.size(), queryText);
+        }
+
+        return docIdToScores;
+    }
+
+    /**
+     * Process judgments to extract document scores (asynchronous - deprecated, kept for compatibility)
      */
     private void processJudgments(String queryText, List<String> judgmentIds, ActionListener<Map<String, String>> listener) {
+        log.info("Starting judgment processing for query: {} with {} judgments", queryText, judgmentIds.size());
+
         Map<String, String> docIdToScores = new HashMap<>();
         AtomicInteger completedJudgments = new AtomicInteger(0);
 

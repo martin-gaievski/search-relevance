@@ -23,6 +23,7 @@ import java.util.stream.Collectors;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.index.IndexResponse;
+import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
 import org.opensearch.cluster.service.ClusterService;
@@ -58,7 +59,7 @@ public class PutExperimentTransportAction extends HandledTransportAction<PutExpe
     private final SearchConfigurationDao searchConfigurationDao;
     private final MetricsHelper metricsHelper;
     private final HybridSearchTaskManager hybridSearchTaskManager;
-    private final HybridOptimizerTaskSupport hybridOptimizerTaskSupport;
+    private final HybridOptimizerExperimentProcessor hybridOptimizerExperimentProcessor;
 
     private static final Logger LOGGER = LogManager.getLogger(PutExperimentTransportAction.class);
 
@@ -83,7 +84,11 @@ public class PutExperimentTransportAction extends HandledTransportAction<PutExpe
         this.searchConfigurationDao = searchConfigurationDao;
         this.metricsHelper = metricsHelper;
         this.hybridSearchTaskManager = hybridSearchTaskManager;
-        this.hybridOptimizerTaskSupport = new HybridOptimizerTaskSupport(judgmentDao, experimentVariantDao, hybridSearchTaskManager);
+        this.hybridOptimizerExperimentProcessor = new HybridOptimizerExperimentProcessor(
+            judgmentDao,
+            experimentVariantDao,
+            hybridSearchTaskManager
+        );
     }
 
     @Override
@@ -128,22 +133,100 @@ public class PutExperimentTransportAction extends HandledTransportAction<PutExpe
     }
 
     private void triggerAsyncProcessing(String experimentId, PutExperimentRequest request) {
-        try {
-            QuerySet querySet = querySetDao.getQuerySetSync(request.getQuerySetId());
-            List<String> queryTextWithReferences = querySet.querySetQueries().stream().map(e -> e.queryText()).collect(Collectors.toList());
+        // First, get QuerySet asynchronously
+        querySetDao.getQuerySet(request.getQuerySetId(), ActionListener.wrap(querySetResponse -> {
+            try {
+                QuerySet querySet = convertToQuerySet(querySetResponse);
+                List<String> queryTextWithReferences = querySet.querySetQueries()
+                    .stream()
+                    .map(e -> e.queryText())
+                    .collect(Collectors.toList());
 
-            List<SearchConfiguration> searchConfigurations = request.getSearchConfigurationList()
-                .stream()
-                .map(id -> searchConfigurationDao.getSearchConfigurationSync(id))
-                .collect(Collectors.toList());
-            Map<String, List<String>> indexAndQueries = new HashMap<>();
-            for (SearchConfiguration config : searchConfigurations) {
-                indexAndQueries.put(config.id(), Arrays.asList(config.index(), config.query(), config.searchPipeline()));
+                // Then get SearchConfigurations asynchronously
+                fetchSearchConfigurationsAsync(experimentId, request, queryTextWithReferences);
+            } catch (Exception e) {
+                handleAsyncFailure(experimentId, request, "Failed to process QuerySet", e);
             }
-            calculateMetricsAsync(experimentId, request, indexAndQueries, queryTextWithReferences);
-        } catch (Exception e) {
-            handleAsyncFailure(experimentId, request, "Failed to start async processing", e);
+        }, e -> { handleAsyncFailure(experimentId, request, "Failed to fetch QuerySet", e); }));
+    }
+
+    private void fetchSearchConfigurationsAsync(String experimentId, PutExperimentRequest request, List<String> queryTextWithReferences) {
+        Map<String, List<String>> indexAndQueries = new HashMap<>();
+        AtomicInteger pendingConfigs = new AtomicInteger(request.getSearchConfigurationList().size());
+        AtomicBoolean hasFailure = new AtomicBoolean(false);
+
+        for (String configId : request.getSearchConfigurationList()) {
+            searchConfigurationDao.getSearchConfiguration(configId, ActionListener.wrap(searchConfigResponse -> {
+                try {
+                    if (hasFailure.get()) return;
+
+                    SearchConfiguration config = convertToSearchConfiguration(searchConfigResponse);
+                    synchronized (indexAndQueries) {
+                        indexAndQueries.put(config.id(), Arrays.asList(config.index(), config.query(), config.searchPipeline()));
+                    }
+
+                    // Check if all configurations are fetched
+                    if (pendingConfigs.decrementAndGet() == 0) {
+                        calculateMetricsAsync(experimentId, request, indexAndQueries, queryTextWithReferences);
+                    }
+                } catch (Exception e) {
+                    if (hasFailure.compareAndSet(false, true)) {
+                        handleAsyncFailure(experimentId, request, "Failed to process SearchConfiguration", e);
+                    }
+                }
+            }, e -> {
+                if (hasFailure.compareAndSet(false, true)) {
+                    handleAsyncFailure(experimentId, request, "Failed to fetch SearchConfiguration: " + configId, e);
+                }
+            }));
         }
+    }
+
+    private QuerySet convertToQuerySet(SearchResponse response) {
+        if (response.getHits().getTotalHits().value() == 0) {
+            throw new SearchRelevanceException("QuerySet not found", RestStatus.NOT_FOUND);
+        }
+
+        Map<String, Object> sourceMap = response.getHits().getHits()[0].getSourceAsMap();
+
+        // Convert querySetQueries from list of maps to List<QuerySetEntry>
+        List<org.opensearch.searchrelevance.model.QuerySetEntry> querySetEntries = new ArrayList<>();
+        Object querySetQueriesObj = sourceMap.get("querySetQueries");
+        if (querySetQueriesObj instanceof List) {
+            List<Map<String, Object>> querySetQueriesList = (List<Map<String, Object>>) querySetQueriesObj;
+            querySetEntries = querySetQueriesList.stream()
+                .map(
+                    entryMap -> org.opensearch.searchrelevance.model.QuerySetEntry.Builder.builder()
+                        .queryText((String) entryMap.get("queryText"))
+                        .build()
+                )
+                .collect(Collectors.toList());
+        }
+
+        return org.opensearch.searchrelevance.model.QuerySet.Builder.builder()
+            .id((String) sourceMap.get("id"))
+            .name((String) sourceMap.get("name"))
+            .description((String) sourceMap.get("description"))
+            .timestamp((String) sourceMap.get("timestamp"))
+            .sampling((String) sourceMap.get("sampling"))
+            .querySetQueries(querySetEntries)
+            .build();
+    }
+
+    private SearchConfiguration convertToSearchConfiguration(SearchResponse response) {
+        if (response.getHits().getTotalHits().value() == 0) {
+            throw new SearchRelevanceException("SearchConfiguration not found", RestStatus.NOT_FOUND);
+        }
+
+        Map<String, Object> source = response.getHits().getHits()[0].getSourceAsMap();
+        return new SearchConfiguration(
+            (String) source.get("id"),
+            (String) source.get("name"),
+            (String) source.get("timestamp"),
+            (String) source.get("index"),
+            (String) source.get("query"),
+            (String) source.get("searchPipeline")
+        );
     }
 
     private void calculateMetricsAsync(
@@ -217,7 +300,7 @@ public class PutExperimentTransportAction extends HandledTransportAction<PutExpe
                 );
             } else if (request.getType() == ExperimentType.HYBRID_OPTIMIZER) {
                 // Use our task manager implementation for hybrid optimizer
-                hybridOptimizerTaskSupport.processHybridOptimizerExperiment(
+                hybridOptimizerExperimentProcessor.processHybridOptimizerExperiment(
                     experimentId,
                     queryText,
                     indexAndQueries,
