@@ -12,7 +12,6 @@ import static org.opensearch.searchrelevance.metrics.EvaluationMetrics.calculate
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.Semaphore;
@@ -21,8 +20,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
-import org.opensearch.action.StepListener;
-import org.opensearch.action.index.IndexResponse;
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.common.inject.Inject;
@@ -50,11 +47,11 @@ import lombok.extern.log4j.Log4j2;
  */
 @Log4j2
 public class HybridSearchTaskManager {
-    private static final int DEFAULT_MIN_CONCURRENT_THREADS = 16;
-
-    // Concurrency control settings - dynamic based on processor count
     public static final int TASK_RETRY_DELAY_MILLISECONDS = 2000;
+    // Concurrency control settings - dynamic based on processor count
     public static final int ALLOCATED_PROCESSORS = OpenSearchExecutors.allocatedProcessors(Settings.EMPTY);
+
+    private static final int DEFAULT_MIN_CONCURRENT_THREADS = 16;
 
     // Dynamic concurrency limit based on available processors
     private final int maxConcurrentTasks;
@@ -395,7 +392,23 @@ public class HybridSearchTaskManager {
         try {
             if (response.getHits().getTotalHits().value() == 0) {
                 log.warn("No hits found for search config: {} and variant: {}", searchConfigId, experimentVariant.getId());
-                taskContext.completeVariantFailure();
+
+                // Always persist variant even with no hits, create with ERROR status
+                ExperimentVariant noHitsVariant = new ExperimentVariant(
+                    experimentVariant.getId(),
+                    TimeUtils.getTimestamp(),
+                    experimentVariant.getType(),
+                    AsyncStatus.ERROR,
+                    experimentId,
+                    experimentVariant.getParameters(),
+                    Map.of("evaluationResultId", evaluationId, "error", "No search hits found")
+                );
+
+                experimentVariantDao.putExperimentVariant(noHitsVariant, ActionListener.wrap(success -> {
+                    log.debug("Persisted no-hits variant: {}", experimentVariant.getId());
+                    taskContext.completeVariantFailure();
+                }, error -> handleTaskFailure(experimentVariant, error, taskContext)));
+
                 return;
             }
 
@@ -426,7 +439,7 @@ public class HybridSearchTaskManager {
     }
 
     /**
-     * Update experiment variant with evaluation result
+     * Create experiment variant with final status
      */
     private void updateExperimentVariant(
         ExperimentVariant experimentVariant,
@@ -435,7 +448,8 @@ public class HybridSearchTaskManager {
         String evaluationId,
         TaskContext taskContext
     ) {
-        ExperimentVariant experimentVariantResult = new ExperimentVariant(
+        // Create variant directly with COMPLETED status
+        ExperimentVariant completedVariant = new ExperimentVariant(
             experimentVariant.getId(),
             TimeUtils.getTimestamp(),
             experimentVariant.getType(),
@@ -445,16 +459,16 @@ public class HybridSearchTaskManager {
             Map.of("evaluationResultId", evaluationId)
         );
 
-        StepListener<IndexResponse> voidStepListener = new StepListener<>();
-        experimentVariantDao.updateExperimentVariant(experimentVariantResult, voidStepListener);
+        // Single write with final status
+        experimentVariantDao.putExperimentVariant(completedVariant, ActionListener.wrap(response -> {
+            log.debug("Created completed experiment variant: {}", experimentVariant.getId());
 
-        voidStepListener.whenComplete(indexResponse -> {
             synchronized (taskContext.configToExperimentVariants) {
                 Map<String, Object> map = (Map<String, Object>) taskContext.configToExperimentVariants.get(searchConfigId);
                 map.put(experimentVariant.getId(), evaluationId);
             }
             taskContext.completeVariantSuccess();
-        }, error -> { handleTaskFailure(experimentVariant, error, taskContext); });
+        }, error -> handleTaskFailure(experimentVariant, error, taskContext)));
     }
 
     /**
@@ -477,7 +491,8 @@ public class HybridSearchTaskManager {
             Map.of("evaluationResultId", evaluationId, "error", e.getMessage())
         );
 
-        experimentVariantDao.updateExperimentVariant(experimentVariantResult, ActionListener.wrap(success -> {
+        // Single write with ERROR status, consistent with success path
+        experimentVariantDao.putExperimentVariant(experimentVariantResult, ActionListener.wrap(success -> {
             // Just log the error but continue with other variants
             log.error("Error executing variant {}: {}", experimentVariant.getId(), e.getMessage());
             taskContext.completeVariantFailure();
@@ -564,42 +579,31 @@ public class HybridSearchTaskManager {
          */
         private void completeVariant() {
             if (remainingVariants.decrementAndGet() == 0) {
-                // All variants for this search configuration are complete
-                // Check if ALL variants failed
-                if (failedVariants.get() == totalVariants) {
-                    // All variants failed - this should cause the entire experiment to fail
-                    log.error("All {} variants failed for search config {} in experiment {}", totalVariants, searchConfigId, experimentId);
-
-                    if (hasFailure.compareAndSet(false, true)) {
-                        finalListener.onFailure(
-                            new RuntimeException(
-                                String.format(
-                                    Locale.ROOT,
-                                    "All %d variants failed for search configuration %s",
-                                    totalVariants,
-                                    searchConfigId
-                                )
-                            )
-                        );
-                        return;
-                    }
-                }
-
-                // At least some variants succeeded, format results and continue
+                // Create results even if all variants failed (non-fatal to experiment)
                 Map<String, Object> transformedConfigToExperimentVariants = new HashMap<>();
                 transformedConfigToExperimentVariants.put("searchConfigurationId", searchConfigId);
 
                 List<Map<String, Object>> evaluationResults = formatEvaluationResults();
                 transformedConfigToExperimentVariants.put("evaluationResults", evaluationResults);
 
-                // Add failure summary if there were partial failures
-                if (failedVariants.get() > 0) {
-                    Map<String, Object> failureSummary = new HashMap<>();
-                    failureSummary.put("totalVariants", totalVariants);
-                    failureSummary.put("successfulVariants", successfulVariants.get());
-                    failureSummary.put("failedVariants", failedVariants.get());
-                    transformedConfigToExperimentVariants.put("failureSummary", failureSummary);
+                // Add comprehensive failure summary
+                Map<String, Object> summary = new HashMap<>();
+                summary.put("totalVariants", totalVariants);
+                summary.put("successfulVariants", successfulVariants.get());
+                summary.put("failedVariants", failedVariants.get());
+                transformedConfigToExperimentVariants.put("summary", summary);
 
+                if (failedVariants.get() == totalVariants) {
+                    // All variants failed for this search config - log error but continue experiment
+                    log.error(
+                        "All {} variants failed for search config {} in experiment {} - continuing experiment",
+                        totalVariants,
+                        searchConfigId,
+                        experimentId
+                    );
+                    transformedConfigToExperimentVariants.put("status", "ALL_FAILED");
+                } else if (failedVariants.get() > 0) {
+                    // Partial failures - log warning
                     log.warn(
                         "Partial failure for search config {} in experiment {}: {}/{} variants succeeded",
                         searchConfigId,
@@ -607,11 +611,14 @@ public class HybridSearchTaskManager {
                         successfulVariants.get(),
                         totalVariants
                     );
+                    transformedConfigToExperimentVariants.put("status", "PARTIAL_SUCCESS");
+                } else {
+                    transformedConfigToExperimentVariants.put("status", "SUCCESS");
                 }
 
+                // continue, don't fail the entire experiment for one search config
                 finalListener.onResponse(transformedConfigToExperimentVariants);
 
-                // Clean up this task context
                 synchronized (experimentTaskContexts) {
                     experimentTaskContexts.remove(experimentId);
                 }

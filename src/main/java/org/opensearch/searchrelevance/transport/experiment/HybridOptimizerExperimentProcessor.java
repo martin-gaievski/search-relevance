@@ -96,17 +96,13 @@ public class HybridOptimizerExperimentProcessor {
             queryText
         );
 
-        // Log completion of variant creation
         log.info(
             "Experiment {}: Created all {} experiment variants, proceeding to judgment processing",
             experimentId,
             experimentVariantDTOs.size()
         );
 
-        // Create experiment variants
-        for (int experimentVariantIndex = 0; experimentVariantIndex < experimentVariantDTOs.size(); experimentVariantIndex++) {
-            ExperimentVariantHybridSearchDTO experimentVariantDTO = experimentVariantDTOs.get(experimentVariantIndex);
-            final int currentIndex = experimentVariantIndex;
+        for (ExperimentVariantHybridSearchDTO experimentVariantDTO : experimentVariantDTOs) {
             Map<String, Object> parameters = new HashMap<>(
                 Map.of(
                     EXPERIMENT_OPTION_NORMALIZATION_TECHNIQUE,
@@ -118,6 +114,8 @@ public class HybridOptimizerExperimentProcessor {
                 )
             );
             String experimentVariantId = UUID.randomUUID().toString();
+
+            // Create lightweight ExperimentVariant without storing it to index
             ExperimentVariant experimentVariant = new ExperimentVariant(
                 experimentVariantId,
                 TimeUtils.getTimestamp(),
@@ -128,21 +126,13 @@ public class HybridOptimizerExperimentProcessor {
                 Map.of()
             );
             experimentVariants.add(experimentVariant);
-
-            // Store experiment variant
-            experimentVariantDao.putExperimentVariant(experimentVariant, ActionListener.wrap(success -> {
-                log.debug("Created experiment variant: {}", experimentVariantId);
-                // Log progress every 1000 variants
-                if (currentIndex % 1000 == 0) {
-                    log.info(
-                        "Experiment {}: Created {} of {} experiment variants",
-                        experimentId,
-                        currentIndex + 1,
-                        experimentVariantDTOs.size()
-                    );
-                }
-            }, error -> log.error("Failed to create experiment variant: {}", experimentVariantId, error)));
         }
+
+        log.info(
+            "Experiment {}: Created {} experiment variants, proceeding to judgment processing",
+            experimentId,
+            experimentVariants.size()
+        );
 
         // Process experiment variants for each search configuration
         Map<String, Object> hydratedResults = new ConcurrentHashMap<>();
