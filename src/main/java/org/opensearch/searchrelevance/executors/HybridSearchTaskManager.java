@@ -14,6 +14,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -34,11 +35,14 @@ import org.opensearch.searchrelevance.dao.ExperimentVariantDao;
 import org.opensearch.searchrelevance.experiment.QuerySourceUtil;
 import org.opensearch.searchrelevance.model.AsyncStatus;
 import org.opensearch.searchrelevance.model.EvaluationResult;
+import org.opensearch.searchrelevance.model.ExperimentBatchStatus;
 import org.opensearch.searchrelevance.model.ExperimentVariant;
 import org.opensearch.searchrelevance.model.builder.SearchRequestBuilder;
 import org.opensearch.searchrelevance.utils.TimeUtils;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
+
+import com.google.common.annotations.VisibleForTesting;
 
 import lombok.extern.log4j.Log4j2;
 
@@ -52,11 +56,10 @@ public class HybridSearchTaskManager {
     public static final int ALLOCATED_PROCESSORS = OpenSearchExecutors.allocatedProcessors(Settings.EMPTY);
 
     private static final int DEFAULT_MIN_CONCURRENT_THREADS = 16;
+    private static final String THREAD_POOL_EXECUTOR_NAME = ThreadPool.Names.GENERIC;
 
     // Dynamic concurrency limit based on available processors
     private final int maxConcurrentTasks;
-
-    // Task completion tracking
     private final Map<String, TaskContext> experimentTaskContexts = new HashMap<>();
 
     // Concurrency control - limit active search tasks to prevent resource exhaustion
@@ -107,7 +110,6 @@ public class HybridSearchTaskManager {
      * @param configToExperimentVariants Map to collect results
      * @param finalListener Listener to notify when all tasks are complete
      * @param hasFailure Flag to track failures
-     * @param pendingConfigurations Counter of pending configurations
      */
     public void scheduleTasks(
         String experimentId,
@@ -121,8 +123,7 @@ public class HybridSearchTaskManager {
         Map<String, String> docIdToScores,
         Map<String, Object> configToExperimentVariants,
         ActionListener<Map<String, Object>> finalListener,
-        AtomicBoolean hasFailure,
-        AtomicInteger pendingConfigurations
+        AtomicBoolean hasFailure
     ) {
         // Create a context to track tasks for this experiment
         TaskContext taskContext = new TaskContext(
@@ -131,8 +132,7 @@ public class HybridSearchTaskManager {
             experimentVariants.size(),
             configToExperimentVariants,
             finalListener,
-            hasFailure,
-            pendingConfigurations
+            hasFailure
         );
 
         synchronized (experimentTaskContexts) {
@@ -215,7 +215,7 @@ public class HybridSearchTaskManager {
                     }
 
                     @Override
-                    protected void doRun() throws Exception {
+                    protected void doRun() {
                         try {
                             executeVariantTaskWithPermit(
                                 experimentId,
@@ -229,14 +229,14 @@ public class HybridSearchTaskManager {
                                 docIdToScores,
                                 taskContext
                             );
-                        } catch (Exception e) {
+                        } catch (Exception exception) {
                             // Always release permit on exception
                             concurrencyControl.release();
-                            throw e;
+                            throw exception;
                         }
                     }
                 });
-            } catch (java.util.concurrent.RejectedExecutionException e) {
+            } catch (RejectedExecutionException rejectedExecutionException) {
                 // Thread pool queue is full, release permit and retry with backpressure
                 concurrencyControl.release();
                 log.warn("Thread pool queue full, scheduling with backpressure for variant: {}", experimentVariant.getId());
@@ -369,7 +369,7 @@ public class HybridSearchTaskManager {
                 docIdToScores,
                 taskContext
             );
-        }, new TimeValue(TASK_RETRY_DELAY_MILLISECONDS, TimeUnit.MILLISECONDS), ThreadPool.Names.GENERIC);
+        }, new TimeValue(TASK_RETRY_DELAY_MILLISECONDS, TimeUnit.MILLISECONDS), THREAD_POOL_EXECUTOR_NAME);
     }
 
     /**
@@ -393,15 +393,15 @@ public class HybridSearchTaskManager {
             if (response.getHits().getTotalHits().value() == 0) {
                 log.warn("No hits found for search config: {} and variant: {}", searchConfigId, experimentVariant.getId());
 
-                // Always persist variant even with no hits, create with ERROR status
+                // Always persist variant even with no hits
                 ExperimentVariant noHitsVariant = new ExperimentVariant(
                     experimentVariant.getId(),
                     TimeUtils.getTimestamp(),
                     experimentVariant.getType(),
-                    AsyncStatus.ERROR,
+                    AsyncStatus.COMPLETED,
                     experimentId,
                     experimentVariant.getParameters(),
-                    Map.of("evaluationResultId", evaluationId, "error", "No search hits found")
+                    Map.of("evaluationResultId", evaluationId, "details", "no search hits found")
                 );
 
                 experimentVariantDao.putExperimentVariant(noHitsVariant, ActionListener.wrap(success -> {
@@ -471,9 +471,6 @@ public class HybridSearchTaskManager {
         }, error -> handleTaskFailure(experimentVariant, error, taskContext)));
     }
 
-    /**
-     * Handle search failure
-     */
     private void handleSearchFailure(
         Exception e,
         ExperimentVariant experimentVariant,
@@ -496,23 +493,66 @@ public class HybridSearchTaskManager {
             // Just log the error but continue with other variants
             log.error("Error executing variant {}: {}", experimentVariant.getId(), e.getMessage());
             taskContext.completeVariantFailure();
-        }, error -> { handleTaskFailure(experimentVariant, error, taskContext); }));
+        }, error -> {
+            // Handle DAO write failure more gracefully - don't fail entire experiment
+            log.error("Failed to persist error status for variant {}: {}", experimentVariant.getId(), error.getMessage());
+            taskContext.completeVariantFailure();
+        }));
+    }
+
+    private void handleTaskFailure(ExperimentVariant experimentVariant, Exception e, TaskContext taskContext) {
+        // Check if this is a critical system failure vs individual variant failure
+        if (isCriticalSystemFailure(e)) {
+            if (taskContext.hasFailure.compareAndSet(false, true)) {
+                log.error(
+                    "Critical system failure processing hybrid search task for variant {}: {}",
+                    experimentVariant.getId(),
+                    e.getMessage()
+                );
+                taskContext.finalListener.onFailure(e);
+            }
+        } else {
+            // Treat as individual variant failure - don't stop entire experiment
+            log.error("Variant failure for {}: {}", experimentVariant.getId(), e.getMessage());
+            taskContext.completeVariantFailure();
+        }
     }
 
     /**
-     * Handle task failure
+     * Determine if a throwable represents a critical system failure that should stop the entire experiment
+     * vs an individual variant failure that should be recorded but not stop processing
      */
-    private void handleTaskFailure(ExperimentVariant experimentVariant, Exception e, TaskContext taskContext) {
-        if (taskContext.hasFailure.compareAndSet(false, true)) {
-            log.error("Fatal error processing hybrid search task for variant {}: {}", experimentVariant.getId(), e.getMessage());
-            taskContext.finalListener.onFailure(e);
+    private boolean isCriticalSystemFailure(Throwable throwable) {
+        // Check the current throwable and walk up the cause chain
+        Throwable current = throwable;
+        while (current != null) {
+            // Critical system errors that should stop the experiment
+            if (current instanceof OutOfMemoryError || current instanceof StackOverflowError) {
+                return true;
+            }
+
+            // Check for OpenSearch-specific critical exceptions by class name
+            // This avoids string matching while being resilient to different OpenSearch versions
+            String className = current.getClass().getSimpleName();
+            if (className.contains("CircuitBreakingException")
+                || className.contains("ClusterBlockException")
+                || className.contains("TooManyRequestsException")) {
+                return true;
+            }
+
+            // Move to the cause
+            current = current.getCause();
         }
+
+        // All other failures (including bulk write failures) are treated as individual variant failures
+        return false;
     }
 
     /**
      * Get current concurrency metrics for monitoring
      */
-    public Map<String, Object> getConcurrencyMetrics() {
+    @VisibleForTesting
+    protected Map<String, Object> getConcurrencyMetrics() {
         Map<String, Object> metrics = new HashMap<>();
         metrics.put("active_experiments", experimentTaskContexts.size());
         metrics.put("max_concurrent_tasks", maxConcurrentTasks);
@@ -535,7 +575,6 @@ public class HybridSearchTaskManager {
         private final Map<String, Object> configToExperimentVariants;
         private final ActionListener<Map<String, Object>> finalListener;
         private final AtomicBoolean hasFailure;
-        private final AtomicInteger pendingConfigurations;
 
         public TaskContext(
             String experimentId,
@@ -543,8 +582,7 @@ public class HybridSearchTaskManager {
             int totalVariants,
             Map<String, Object> configToExperimentVariants,
             ActionListener<Map<String, Object>> finalListener,
-            AtomicBoolean hasFailure,
-            AtomicInteger pendingConfigurations
+            AtomicBoolean hasFailure
         ) {
             this.experimentId = experimentId;
             this.searchConfigId = searchConfigId;
@@ -555,7 +593,6 @@ public class HybridSearchTaskManager {
             this.configToExperimentVariants = configToExperimentVariants;
             this.finalListener = finalListener;
             this.hasFailure = hasFailure;
-            this.pendingConfigurations = pendingConfigurations;
         }
 
         /**
@@ -586,7 +623,7 @@ public class HybridSearchTaskManager {
                 List<Map<String, Object>> evaluationResults = formatEvaluationResults();
                 transformedConfigToExperimentVariants.put("evaluationResults", evaluationResults);
 
-                // Add comprehensive failure summary
+                // Add failure summary
                 Map<String, Object> summary = new HashMap<>();
                 summary.put("totalVariants", totalVariants);
                 summary.put("successfulVariants", successfulVariants.get());
@@ -601,7 +638,7 @@ public class HybridSearchTaskManager {
                         searchConfigId,
                         experimentId
                     );
-                    transformedConfigToExperimentVariants.put("status", "ALL_FAILED");
+                    transformedConfigToExperimentVariants.put("status", ExperimentBatchStatus.ALL_FAILED);
                 } else if (failedVariants.get() > 0) {
                     // Partial failures - log warning
                     log.warn(
@@ -611,9 +648,9 @@ public class HybridSearchTaskManager {
                         successfulVariants.get(),
                         totalVariants
                     );
-                    transformedConfigToExperimentVariants.put("status", "PARTIAL_SUCCESS");
+                    transformedConfigToExperimentVariants.put("status", ExperimentBatchStatus.PARTIAL_SUCCESS);
                 } else {
-                    transformedConfigToExperimentVariants.put("status", "SUCCESS");
+                    transformedConfigToExperimentVariants.put("status", ExperimentBatchStatus.SUCCESS);
                 }
 
                 // continue, don't fail the entire experiment for one search config

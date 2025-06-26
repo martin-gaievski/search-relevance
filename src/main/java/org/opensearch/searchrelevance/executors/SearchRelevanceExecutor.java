@@ -30,15 +30,9 @@ public final class SearchRelevanceExecutor {
 
     private static final String SEARCH_RELEVANCE_EXEC_THREAD_POOL_NAME = "_plugin_search_relevance_executor";
     private static final Integer DEFAULT_SEARCH_RELEVANCE_EXEC_THREAD_POOL_QUEUE_SIZE = 1000;
-    private static final Integer MAX_QUEUE_SIZE = 10000;
-    private static final Integer MIN_QUEUE_SIZE = 100;
     private static final Integer MAX_THREAD_SIZE = 1000;
     private static final Integer MIN_THREAD_SIZE = 2;
     private static final Integer PROCESSOR_COUNT_DIVISOR = 2;
-
-    // Configuration setting names
-    public static final String SEARCH_RELEVANCE_THREAD_POOL_SIZE_SETTING = "plugins.search_relevance.thread_pool.size";
-    public static final String SEARCH_RELEVANCE_THREAD_POOL_QUEUE_SIZE_SETTING = "plugins.search_relevance.thread_pool.queue_size";
 
     private static TaskExecutor taskExecutor;
 
@@ -49,7 +43,7 @@ public final class SearchRelevanceExecutor {
      */
     public static ExecutorBuilder<?> getExecutorBuilder(final Settings settings) {
         int numberOfThreads = getFixedNumberOfThreadSize(settings);
-        int queueSize = getConfiguredQueueSize(settings);
+        int queueSize = DEFAULT_SEARCH_RELEVANCE_EXEC_THREAD_POOL_QUEUE_SIZE;
         return new FixedExecutorBuilder(
             settings,
             SEARCH_RELEVANCE_EXEC_THREAD_POOL_NAME,
@@ -94,19 +88,5 @@ public final class SearchRelevanceExecutor {
         final int allocatedProcessors = OpenSearchExecutors.allocatedProcessors(settings);
         int threadSize = Math.max(allocatedProcessors / PROCESSOR_COUNT_DIVISOR, MIN_THREAD_SIZE);
         return Math.min(threadSize, MAX_THREAD_SIZE);
-    }
-
-    /**
-     * Get configured queue size from settings with bounds checking
-     * @param settings Node level settings
-     * @return Queue size for the thread pool
-     */
-    private static int getConfiguredQueueSize(final Settings settings) {
-        int queueSize = settings.getAsInt(
-            SEARCH_RELEVANCE_THREAD_POOL_QUEUE_SIZE_SETTING,
-            DEFAULT_SEARCH_RELEVANCE_EXEC_THREAD_POOL_QUEUE_SIZE
-        );
-        // Ensure queue size is within reasonable bounds
-        return Math.max(MIN_QUEUE_SIZE, Math.min(queueSize, MAX_QUEUE_SIZE));
     }
 }

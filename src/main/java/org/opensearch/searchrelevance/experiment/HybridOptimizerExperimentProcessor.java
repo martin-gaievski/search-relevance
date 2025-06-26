@@ -5,7 +5,7 @@
  * this file be licensed under the Apache-2.0 license or a
  * compatible open source license.
  */
-package org.opensearch.searchrelevance.transport.experiment;
+package org.opensearch.searchrelevance.experiment;
 
 import static org.opensearch.searchrelevance.common.MetricsConstants.POINTWISE_FIELD_NAME_SEARCH_CONFIGURATION_ID;
 import static org.opensearch.searchrelevance.experiment.ExperimentOptionsForHybridSearch.EXPERIMENT_OPTION_COMBINATION_TECHNIQUE;
@@ -24,12 +24,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.core.action.ActionListener;
-import org.opensearch.searchrelevance.dao.ExperimentVariantDao;
 import org.opensearch.searchrelevance.dao.JudgmentDao;
 import org.opensearch.searchrelevance.executors.HybridSearchTaskManager;
-import org.opensearch.searchrelevance.experiment.ExperimentOptionsFactory;
-import org.opensearch.searchrelevance.experiment.ExperimentOptionsForHybridSearch;
-import org.opensearch.searchrelevance.experiment.ExperimentVariantHybridSearchDTO;
 import org.opensearch.searchrelevance.model.AsyncStatus;
 import org.opensearch.searchrelevance.model.ExperimentType;
 import org.opensearch.searchrelevance.model.ExperimentVariant;
@@ -44,16 +40,10 @@ import lombok.extern.log4j.Log4j2;
 public class HybridOptimizerExperimentProcessor {
 
     private final JudgmentDao judgmentDao;
-    private final ExperimentVariantDao experimentVariantDao;
     private final HybridSearchTaskManager taskManager;
 
-    public HybridOptimizerExperimentProcessor(
-        JudgmentDao judgmentDao,
-        ExperimentVariantDao experimentVariantDao,
-        HybridSearchTaskManager taskManager
-    ) {
+    public HybridOptimizerExperimentProcessor(JudgmentDao judgmentDao, HybridSearchTaskManager taskManager) {
         this.judgmentDao = judgmentDao;
-        this.experimentVariantDao = experimentVariantDao;
         this.taskManager = taskManager;
     }
 
@@ -65,8 +55,6 @@ public class HybridOptimizerExperimentProcessor {
      * @param indexAndQueries Map of search configuration IDs to [index, query]
      * @param judgmentList List of judgment IDs
      * @param size Result size
-     * @param finalResults List to store final results
-     * @param pendingQueries Counter for pending queries
      * @param hasFailure Failure flag
      * @param listener Listener to notify when processing is complete
      */
@@ -76,8 +64,6 @@ public class HybridOptimizerExperimentProcessor {
         Map<String, List<String>> indexAndQueries,
         List<String> judgmentList,
         int size,
-        List<Map<String, Object>> finalResults,
-        AtomicInteger pendingQueries,
         AtomicBoolean hasFailure,
         ActionListener<Map<String, Object>> listener
     ) {
@@ -95,13 +81,6 @@ public class HybridOptimizerExperimentProcessor {
             experimentVariantDTOs.size(),
             queryText
         );
-
-        log.info(
-            "Experiment {}: Created all {} experiment variants, proceeding to judgment processing",
-            experimentId,
-            experimentVariantDTOs.size()
-        );
-
         for (ExperimentVariantHybridSearchDTO experimentVariantDTO : experimentVariantDTOs) {
             Map<String, Object> parameters = new HashMap<>(
                 Map.of(
@@ -146,11 +125,9 @@ public class HybridOptimizerExperimentProcessor {
             }
 
             Map<String, String> docIdToScores = processJudgments(queryText, judgmentResponses);
-
-            // Continue processing even if no ratings found - this is expected for some queries
             log.info("Processing search configurations for query '{}' with {} document ratings", queryText, docIdToScores.size());
 
-            // Process search configurations with our task manager
+            // Process search configurations with task manager
             processSearchConfigurations(
                 experimentId,
                 queryText,
@@ -160,8 +137,6 @@ public class HybridOptimizerExperimentProcessor {
                 experimentVariants,
                 docIdToScores,
                 hydratedResults,
-                finalResults,
-                pendingQueries,
                 hasFailure,
                 listener
             );
@@ -218,71 +193,6 @@ public class HybridOptimizerExperimentProcessor {
     }
 
     /**
-     * Process judgments to extract document scores (asynchronous - deprecated, kept for compatibility)
-     */
-    private void processJudgments(String queryText, List<String> judgmentIds, ActionListener<Map<String, String>> listener) {
-        log.info("Starting judgment processing for query: {} with {} judgments", queryText, judgmentIds.size());
-
-        Map<String, String> docIdToScores = new HashMap<>();
-        AtomicInteger completedJudgments = new AtomicInteger(0);
-
-        for (String judgmentId : judgmentIds) {
-            judgmentDao.getJudgment(judgmentId, ActionListener.wrap(judgmentResponse -> {
-                try {
-                    if (judgmentResponse.getHits().getTotalHits().value() == 0) {
-                        log.warn("No judgment found for ID: {}", judgmentId);
-                    } else {
-                        Map<String, Object> sourceAsMap = judgmentResponse.getHits().getHits()[0].getSourceAsMap();
-                        List<Map<String, Object>> judgmentRatings = (List<Map<String, Object>>) sourceAsMap.getOrDefault(
-                            "judgmentRatings",
-                            Collections.emptyList()
-                        );
-
-                        for (Map<String, Object> rating : judgmentRatings) {
-                            if (queryText.equals(rating.get("query"))) {
-                                List<Map<String, String>> docScoreRatings = (List<Map<String, String>>) rating.get("ratings");
-                                docScoreRatings.forEach(
-                                    docScoreRating -> docIdToScores.put(docScoreRating.get("docId"), docScoreRating.get("rating"))
-                                );
-                                break;
-                            }
-                        }
-                    }
-
-                    // Check if all judgments have been processed
-                    if (completedJudgments.incrementAndGet() == judgmentIds.size()) {
-                        if (docIdToScores.isEmpty()) {
-                            log.warn("No ratings found for query: {} in any judgments", queryText);
-                        }
-                        listener.onResponse(docIdToScores);
-                    }
-                } catch (Exception e) {
-                    handleJudgmentFailure(e, judgmentIds, completedJudgments, docIdToScores, listener);
-                }
-            }, error -> handleJudgmentFailure(error, judgmentIds, completedJudgments, docIdToScores, listener)));
-        }
-    }
-
-    private void handleJudgmentFailure(
-        Exception error,
-        List<String> judgmentIds,
-        AtomicInteger completedJudgments,
-        Map<String, String> docIdToScores,
-        ActionListener<Map<String, String>> listener
-    ) {
-        log.error("Failed to fetch judgment: {}", error.getMessage());
-
-        if (completedJudgments.incrementAndGet() == judgmentIds.size()) {
-            if (docIdToScores.isEmpty()) {
-                listener.onFailure(new IllegalStateException("Failed to fetch any valid judgments"));
-            } else {
-                // Proceed with the judgments we were able to fetch
-                listener.onResponse(docIdToScores);
-            }
-        }
-    }
-
-    /**
      * Process search configurations using task manager
      */
     private void processSearchConfigurations(
@@ -294,8 +204,6 @@ public class HybridOptimizerExperimentProcessor {
         List<ExperimentVariant> experimentVariants,
         Map<String, String> docIdToScores,
         Map<String, Object> hydratedResults,
-        List<Map<String, Object>> finalResults,
-        AtomicInteger pendingQueries,
         AtomicBoolean hasFailure,
         ActionListener<Map<String, Object>> finalListener
     ) {
@@ -360,8 +268,7 @@ public class HybridOptimizerExperimentProcessor {
                         }
                     }
                 },
-                hasFailure,
-                pendingConfigurations
+                hasFailure
             );
         }
     }

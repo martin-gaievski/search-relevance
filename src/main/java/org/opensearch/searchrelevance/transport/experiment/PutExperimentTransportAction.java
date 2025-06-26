@@ -37,6 +37,7 @@ import org.opensearch.searchrelevance.dao.QuerySetDao;
 import org.opensearch.searchrelevance.dao.SearchConfigurationDao;
 import org.opensearch.searchrelevance.exception.SearchRelevanceException;
 import org.opensearch.searchrelevance.executors.HybridSearchTaskManager;
+import org.opensearch.searchrelevance.experiment.HybridOptimizerExperimentProcessor;
 import org.opensearch.searchrelevance.metrics.MetricsHelper;
 import org.opensearch.searchrelevance.model.AsyncStatus;
 import org.opensearch.searchrelevance.model.Experiment;
@@ -58,7 +59,6 @@ public class PutExperimentTransportAction extends HandledTransportAction<PutExpe
     private final QuerySetDao querySetDao;
     private final SearchConfigurationDao searchConfigurationDao;
     private final MetricsHelper metricsHelper;
-    private final HybridSearchTaskManager hybridSearchTaskManager;
     private final HybridOptimizerExperimentProcessor hybridOptimizerExperimentProcessor;
 
     private static final Logger LOGGER = LogManager.getLogger(PutExperimentTransportAction.class);
@@ -83,12 +83,7 @@ public class PutExperimentTransportAction extends HandledTransportAction<PutExpe
         this.querySetDao = querySetDao;
         this.searchConfigurationDao = searchConfigurationDao;
         this.metricsHelper = metricsHelper;
-        this.hybridSearchTaskManager = hybridSearchTaskManager;
-        this.hybridOptimizerExperimentProcessor = new HybridOptimizerExperimentProcessor(
-            judgmentDao,
-            experimentVariantDao,
-            hybridSearchTaskManager
-        );
+        this.hybridOptimizerExperimentProcessor = new HybridOptimizerExperimentProcessor(judgmentDao, hybridSearchTaskManager);
     }
 
     @Override
@@ -306,8 +301,6 @@ public class PutExperimentTransportAction extends HandledTransportAction<PutExpe
                     indexAndQueries,
                     judgmentList,
                     request.getSize(),
-                    finalResults,
-                    pendingQueries,
                     hasFailure,
                     ActionListener.wrap(
                         queryResults -> handleQueryResults(
