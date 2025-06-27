@@ -26,12 +26,10 @@ import org.opensearch.action.index.IndexResponse;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
-import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.searchrelevance.dao.ExperimentDao;
-import org.opensearch.searchrelevance.dao.ExperimentVariantDao;
 import org.opensearch.searchrelevance.dao.JudgmentDao;
 import org.opensearch.searchrelevance.dao.QuerySetDao;
 import org.opensearch.searchrelevance.dao.SearchConfigurationDao;
@@ -53,9 +51,7 @@ import org.opensearch.transport.TransportService;
  */
 public class PutExperimentTransportAction extends HandledTransportAction<PutExperimentRequest, IndexResponse> {
 
-    private final ClusterService clusterService;
     private final ExperimentDao experimentDao;
-    private final ExperimentVariantDao experimentVariantDao;
     private final QuerySetDao querySetDao;
     private final SearchConfigurationDao searchConfigurationDao;
     private final MetricsHelper metricsHelper;
@@ -65,11 +61,9 @@ public class PutExperimentTransportAction extends HandledTransportAction<PutExpe
 
     @Inject
     public PutExperimentTransportAction(
-        ClusterService clusterService,
         TransportService transportService,
         ActionFilters actionFilters,
         ExperimentDao experimentDao,
-        ExperimentVariantDao experimentVariantDao,
         QuerySetDao querySetDao,
         SearchConfigurationDao searchConfigurationDao,
         MetricsHelper metricsHelper,
@@ -77,9 +71,7 @@ public class PutExperimentTransportAction extends HandledTransportAction<PutExpe
         HybridSearchTaskManager hybridSearchTaskManager
     ) {
         super(PutExperimentAction.NAME, transportService, actionFilters, PutExperimentRequest::new);
-        this.clusterService = clusterService;
         this.experimentDao = experimentDao;
-        this.experimentVariantDao = experimentVariantDao;
         this.querySetDao = querySetDao;
         this.searchConfigurationDao = searchConfigurationDao;
         this.metricsHelper = metricsHelper;

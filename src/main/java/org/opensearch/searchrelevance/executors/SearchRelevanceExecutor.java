@@ -16,7 +16,6 @@ import org.opensearch.threadpool.ThreadPool;
 
 import lombok.AccessLevel;
 import lombok.NoArgsConstructor;
-import lombok.experimental.PackagePrivate;
 
 /**
  * {@link SearchRelevanceExecutor} provides necessary implementation and instances to execute
@@ -28,7 +27,7 @@ import lombok.experimental.PackagePrivate;
 @NoArgsConstructor(access = AccessLevel.PRIVATE)
 public final class SearchRelevanceExecutor {
 
-    private static final String SEARCH_RELEVANCE_EXEC_THREAD_POOL_NAME = "_plugin_search_relevance_executor";
+    static final String SEARCH_RELEVANCE_EXEC_THREAD_POOL_NAME = "_plugin_search_relevance_executor";
     private static final Integer DEFAULT_SEARCH_RELEVANCE_EXEC_THREAD_POOL_QUEUE_SIZE = 1000;
     private static final Integer MAX_THREAD_SIZE = 1000;
     private static final Integer MIN_THREAD_SIZE = 2;
@@ -72,11 +71,6 @@ public final class SearchRelevanceExecutor {
      */
     public static TaskExecutor getExecutor() {
         return taskExecutor != null ? taskExecutor : new TaskExecutor(Runnable::run);
-    }
-
-    @PackagePrivate
-    public static String getThreadPoolName() {
-        return SEARCH_RELEVANCE_EXEC_THREAD_POOL_NAME;
     }
 
     /**

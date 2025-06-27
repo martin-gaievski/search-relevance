@@ -49,7 +49,6 @@ import org.opensearch.searchrelevance.dao.JudgmentDao;
 import org.opensearch.searchrelevance.dao.QuerySetDao;
 import org.opensearch.searchrelevance.dao.SearchConfigurationDao;
 import org.opensearch.searchrelevance.executors.HybridSearchTaskManager;
-import org.opensearch.searchrelevance.executors.SearchRelevanceExecutor;
 import org.opensearch.searchrelevance.indices.SearchRelevanceIndicesManager;
 import org.opensearch.searchrelevance.metrics.MetricsHelper;
 import org.opensearch.searchrelevance.ml.MLAccessor;
@@ -125,7 +124,7 @@ public class SearchRelevancePluginTests extends OpenSearchTestCase {
 
         // Mock ThreadPool to return a mock executor for SearchRelevanceExecutor
         ExecutorService mockExecutor = mock(ExecutorService.class);
-        when(threadPool.executor(SearchRelevanceExecutor.getThreadPoolName())).thenReturn(mockExecutor);
+        when(threadPool.executor("_plugin_search_relevance_executor")).thenReturn(mockExecutor);
 
         // Mock ClusterService
         when(clusterService.getClusterSettings()).thenReturn(

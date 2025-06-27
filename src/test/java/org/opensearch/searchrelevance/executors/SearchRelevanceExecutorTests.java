@@ -7,6 +7,8 @@
  */
 package org.opensearch.searchrelevance.executors;
 
+import static org.opensearch.searchrelevance.executors.SearchRelevanceExecutor.SEARCH_RELEVANCE_EXEC_THREAD_POOL_NAME;
+
 import org.opensearch.common.settings.Settings;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.threadpool.ExecutorBuilder;
@@ -61,6 +63,6 @@ public class SearchRelevanceExecutorTests extends OpenSearchTestCase {
     }
 
     public void testGetThreadPoolName() {
-        assertEquals("_plugin_search_relevance_executor", SearchRelevanceExecutor.getThreadPoolName());
+        assertEquals("_plugin_search_relevance_executor", SEARCH_RELEVANCE_EXEC_THREAD_POOL_NAME);
     }
 }

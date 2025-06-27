@@ -7,16 +7,14 @@
  */
 package org.opensearch.searchrelevance.executors;
 
+import static org.opensearch.searchrelevance.executors.SearchRelevanceExecutor.SEARCH_RELEVANCE_EXEC_THREAD_POOL_NAME;
 import static org.opensearch.searchrelevance.metrics.EvaluationMetrics.calculateEvaluationMetrics;
 
-import java.io.IOException;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
@@ -26,19 +24,18 @@ import java.util.stream.Collectors;
 
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchResponse;
+import org.opensearch.cluster.block.ClusterBlockException;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.AbstractRunnable;
 import org.opensearch.common.util.concurrent.OpenSearchExecutors;
-import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.core.action.ActionListener;
-import org.opensearch.core.xcontent.ToXContent;
+import org.opensearch.core.common.breaker.CircuitBreakingException;
 import org.opensearch.search.SearchHit;
 import org.opensearch.searchrelevance.dao.EvaluationResultDao;
 import org.opensearch.searchrelevance.dao.ExperimentVariantDao;
 import org.opensearch.searchrelevance.experiment.QuerySourceUtil;
-import org.opensearch.searchrelevance.indices.SearchRelevanceIndices;
 import org.opensearch.searchrelevance.model.AsyncStatus;
 import org.opensearch.searchrelevance.model.EvaluationResult;
 import org.opensearch.searchrelevance.model.ExperimentBatchStatus;
@@ -57,11 +54,11 @@ import lombok.extern.log4j.Log4j2;
  */
 @Log4j2
 public class HybridSearchTaskManager {
-    public static final int TASK_RETRY_DELAY_MILLISECONDS = 1600;
+    public static final int TASK_RETRY_DELAY_MILLISECONDS = 1000;
     // Concurrency control settings - dynamic based on processor count
     public static final int ALLOCATED_PROCESSORS = OpenSearchExecutors.allocatedProcessors(Settings.EMPTY);
 
-    private static final int DEFAULT_MIN_CONCURRENT_THREADS = 16;
+    private static final int DEFAULT_MIN_CONCURRENT_THREADS = 24;
     private static final int PROCESSOR_NUMBER_DIVISOR = 2;
     protected static final String THREAD_POOL_EXECUTOR_NAME = ThreadPool.Names.GENERIC;
 
@@ -77,7 +74,6 @@ public class HybridSearchTaskManager {
     private final EvaluationResultDao evaluationResultDao;
     private final ExperimentVariantDao experimentVariantDao;
     private final ThreadPool threadPool;
-    private final BulkWriteManager bulkWriteManager;
 
     @Inject
     public HybridSearchTaskManager(
@@ -90,9 +86,8 @@ public class HybridSearchTaskManager {
         this.evaluationResultDao = evaluationResultDao;
         this.experimentVariantDao = experimentVariantDao;
         this.threadPool = threadPool;
-        this.bulkWriteManager = new BulkWriteManager(client, threadPool);
 
-        this.maxConcurrentTasks = Math.max(2, Math.min(DEFAULT_MIN_CONCURRENT_THREADS, ALLOCATED_PROCESSORS / PROCESSOR_NUMBER_DIVISOR)); 
+        this.maxConcurrentTasks = Math.max(2, Math.min(DEFAULT_MIN_CONCURRENT_THREADS, ALLOCATED_PROCESSORS / PROCESSOR_NUMBER_DIVISOR));
 
         // Initialize concurrency control with dynamic limit to prevent resource exhaustion
         this.concurrencyControl = new Semaphore(maxConcurrentTasks, true);
@@ -138,6 +133,7 @@ public class HybridSearchTaskManager {
         TaskContext taskContext = new TaskContext(
             experimentId,
             searchConfigId,
+            queryText,
             experimentVariants.size(),
             configToExperimentVariants,
             finalListener,
@@ -192,12 +188,12 @@ public class HybridSearchTaskManager {
             return;
         }
 
-        // Try to acquire semaphore permit BEFORE submitting to thread pool
-        // This prevents queue overflow by controlling task submission rate
+        // try to acquire semaphore permit BEFORE submitting to thread pool
+        // this prevents queue overflow by controlling task submission rate
         if (concurrencyControl.tryAcquire()) {
             try {
                 // Submit to thread pool only after acquiring permit
-                threadPool.executor(SearchRelevanceExecutor.getThreadPoolName()).execute(new AbstractRunnable() {
+                threadPool.executor(SEARCH_RELEVANCE_EXEC_THREAD_POOL_NAME).execute(new AbstractRunnable() {
                     @Override
                     public void onFailure(Exception e) {
                         // Always release permit on failure
@@ -413,7 +409,7 @@ public class HybridSearchTaskManager {
                     Map.of("evaluationResultId", evaluationId, "details", "no search hits found")
                 );
 
-                experimentVariantDao.putExperimentVariant(noHitsVariant, ActionListener.wrap(success -> {
+                experimentVariantDao.putExperimentVariantEfficient(noHitsVariant, ActionListener.wrap(success -> {
                     log.debug("Persisted no-hits variant: {}", experimentVariant.getId());
                     taskContext.completeVariantFailure();
                 }, error -> handleTaskFailure(experimentVariant, error, taskContext)));
@@ -435,7 +431,7 @@ public class HybridSearchTaskManager {
                 metrics
             );
 
-            evaluationResultDao.putEvaluationResult(
+            evaluationResultDao.putEvaluationResultEfficient(
                 evaluationResult,
                 ActionListener.wrap(
                     success -> updateExperimentVariant(experimentVariant, experimentId, searchConfigId, evaluationId, taskContext),
@@ -468,7 +464,6 @@ public class HybridSearchTaskManager {
             Map.of("evaluationResultId", evaluationId)
         );
 
-        // Use TaskContext to handle write (individual or bulk)
         taskContext.scheduleVariantWrite(completedVariant, evaluationId, true);
 
         log.debug("Scheduled write for completed experiment variant: {}", experimentVariant.getId());
@@ -493,12 +488,12 @@ public class HybridSearchTaskManager {
         );
 
         // Single write with ERROR status, consistent with success path
-        experimentVariantDao.putExperimentVariant(experimentVariantResult, ActionListener.wrap(success -> {
+        experimentVariantDao.putExperimentVariantEfficient(experimentVariantResult, ActionListener.wrap(success -> {
             // Just log the error but continue with other variants
             log.error("Error executing variant {}: {}", experimentVariant.getId(), e.getMessage());
             taskContext.completeVariantFailure();
         }, error -> {
-            // Handle DAO write failure more gracefully - don't fail entire experiment
+            // Handle write failure gracefully, don't fail entire experiment
             log.error("Failed to persist error status for variant {}: {}", experimentVariant.getId(), error.getMessage());
             taskContext.completeVariantFailure();
         }));
@@ -534,21 +529,15 @@ public class HybridSearchTaskManager {
             if (current instanceof OutOfMemoryError || current instanceof StackOverflowError) {
                 return true;
             }
-
-            // Check for OpenSearch-specific critical exceptions by class name
-            // This avoids string matching while being resilient to different OpenSearch versions
-            String className = current.getClass().getSimpleName();
-            if (className.contains("CircuitBreakingException")
-                || className.contains("ClusterBlockException")
-                || className.contains("TooManyRequestsException")) {
+            // Check for OpenSearch-specific critical exceptions
+            if (current instanceof CircuitBreakingException || current instanceof ClusterBlockException) {
                 return true;
             }
-
             // Move to the cause
             current = current.getCause();
         }
 
-        // All other failures (including bulk write failures) are treated as individual variant failures
+        // All other failures are treated as individual variant failures
         return false;
     }
 
@@ -562,7 +551,7 @@ public class HybridSearchTaskManager {
         metrics.put("max_concurrent_tasks", maxConcurrentTasks);
         metrics.put("available_permits", concurrencyControl.availablePermits());
         metrics.put("queued_threads", concurrencyControl.getQueueLength());
-        metrics.put("thread_pool", SearchRelevanceExecutor.getThreadPoolName());
+        metrics.put("thread_pool", SEARCH_RELEVANCE_EXEC_THREAD_POOL_NAME);
         return metrics;
     }
 
@@ -572,6 +561,7 @@ public class HybridSearchTaskManager {
     private class TaskContext {
         private final String experimentId;
         private final String searchConfigId;
+        private final String queryText;
         private final AtomicInteger remainingVariants;
         private final AtomicInteger successfulVariants;
         private final AtomicInteger failedVariants;
@@ -580,14 +570,10 @@ public class HybridSearchTaskManager {
         private final ActionListener<Map<String, Object>> finalListener;
         private final AtomicBoolean hasFailure;
 
-        // Bulk write integration
-        private static final int BULK_WRITE_THRESHOLD = 25; // Use bulk writes for 25+ variants (reduced from 50)
-        private final ConcurrentLinkedQueue<BulkWriteManager.BulkWriteItem> pendingWrites;
-        private final boolean useBulkWrites;
-
         public TaskContext(
             String experimentId,
             String searchConfigId,
+            String queryText,
             int totalVariants,
             Map<String, Object> configToExperimentVariants,
             ActionListener<Map<String, Object>> finalListener,
@@ -595,6 +581,7 @@ public class HybridSearchTaskManager {
         ) {
             this.experimentId = experimentId;
             this.searchConfigId = searchConfigId;
+            this.queryText = queryText;
             this.totalVariants = totalVariants;
             this.remainingVariants = new AtomicInteger(totalVariants);
             this.successfulVariants = new AtomicInteger(0);
@@ -603,63 +590,22 @@ public class HybridSearchTaskManager {
             this.finalListener = finalListener;
             this.hasFailure = hasFailure;
 
-            // Initialize bulk write support
-            this.useBulkWrites = totalVariants >= BULK_WRITE_THRESHOLD;
-            this.pendingWrites = useBulkWrites ? new ConcurrentLinkedQueue<>() : null;
-
-            log.info(
-                "TaskContext initialized for experiment {} with {} variants - bulk writes: {}",
-                experimentId,
-                totalVariants,
-                useBulkWrites ? "enabled" : "disabled"
-            );
+            log.info("TaskContext initialized for experiment {} with {} variants", experimentId, totalVariants);
         }
 
         /**
-         * Add a variant to be written (either immediately or in bulk)
+         * Write a variant individually using efficient refresh policy
          */
         public void scheduleVariantWrite(ExperimentVariant variant, String evaluationId, boolean isSuccess) {
-            if (useBulkWrites) {
-                // Collect for bulk write
-                try {
-                    BulkWriteManager.BulkWriteItem item = BulkWriteManager.BulkWriteItem.builder()
-                        .documentId(variant.getId())
-                        .xContentBuilder(variant.toXContent(XContentFactory.jsonBuilder(), ToXContent.EMPTY_PARAMS))
-                        .index(SearchRelevanceIndices.EXPERIMENT_VARIANT)
-                        .build();
-
-                    pendingWrites.offer(item);
-
-                    // Update result mapping for success cases
-                    if (isSuccess) {
-                        synchronized (configToExperimentVariants) {
-                            Map<String, Object> map = (Map<String, Object>) configToExperimentVariants.get(searchConfigId);
-                            map.put(variant.getId(), evaluationId);
-                        }
-                    }
-
-                    log.debug("Added variant {} to bulk write queue (queue size: {})", variant.getId(), pendingWrites.size());
-                } catch (IOException e) {
-                    log.error("Failed to prepare variant {} for bulk write: {}", variant.getId(), e.getMessage());
-                    // Fallback to individual write
-                    writeVariantIndividually(variant, evaluationId, isSuccess);
-                }
-            } else {
-                // Use individual write
-                writeVariantIndividually(variant, evaluationId, isSuccess);
-            }
-        }
-
-        private void writeVariantIndividually(ExperimentVariant variant, String evaluationId, boolean isSuccess) {
-            experimentVariantDao.putExperimentVariant(variant, ActionListener.wrap(response -> {
-                log.debug("Individual write successful for variant: {}", variant.getId());
+            experimentVariantDao.putExperimentVariantEfficient(variant, ActionListener.wrap(response -> {
+                log.debug("write successful for variant: {}", variant.getId());
                 if (isSuccess) {
                     synchronized (configToExperimentVariants) {
                         Map<String, Object> map = (Map<String, Object>) configToExperimentVariants.get(searchConfigId);
                         map.put(variant.getId(), evaluationId);
                     }
                 }
-            }, error -> { log.error("Individual write failed for variant {}: {}", variant.getId(), error.getMessage()); }));
+            }, error -> { log.error("write failed for variant {}: {}", variant.getId(), error.getMessage()); }));
         }
 
         /**
@@ -683,63 +629,8 @@ public class HybridSearchTaskManager {
          */
         private void completeVariant() {
             if (remainingVariants.decrementAndGet() == 0) {
-                // Execute bulk writes if any are pending
-                if (useBulkWrites && pendingWrites != null && !pendingWrites.isEmpty()) {
-                    executeBulkWrites();
-                } else {
-                    // No bulk writes to execute, proceed with final response
-                    finishExperiment();
-                }
-            }
-        }
-
-        /**
-         * Execute collected bulk writes
-         */
-        private void executeBulkWrites() {
-            List<BulkWriteManager.BulkWriteItem> items = new java.util.ArrayList<>();
-
-            // Drain the queue
-            BulkWriteManager.BulkWriteItem item;
-            while ((item = pendingWrites.poll()) != null) {
-                items.add(item);
-            }
-
-            if (items.isEmpty()) {
                 finishExperiment();
-                return;
             }
-
-            log.info("Executing bulk write for {} variants in experiment {}", items.size(), experimentId);
-
-            CompletableFuture<BulkWriteManager.BulkWriteResult> bulkWriteFuture = bulkWriteManager.executeBulkWrite(items);
-
-            bulkWriteFuture.thenAccept(result -> {
-                log.info(
-                    "Bulk write completed for experiment {}: {}/{} successful ({}% success rate)",
-                    experimentId,
-                    result.getSuccessCount(),
-                    result.getTotalItems(),
-                    String.format("%.1f", result.getSuccessRate() * 100)
-                );
-
-                if (result.hasFailures()) {
-                    log.warn(
-                        "Bulk write had {} failures out of {} items for experiment {}",
-                        result.getFailureCount(),
-                        result.getTotalItems(),
-                        experimentId
-                    );
-                }
-
-                // Proceed with final response regardless of bulk write results
-                finishExperiment();
-            }).exceptionally(throwable -> {
-                log.error("Bulk write failed for experiment {}: {}", experimentId, throwable.getMessage());
-                // Still proceed with final response - bulk write failures shouldn't stop experiment completion
-                finishExperiment();
-                return null;
-            });
         }
 
         /**
@@ -762,17 +653,19 @@ public class HybridSearchTaskManager {
 
             if (failedVariants.get() == totalVariants) {
                 log.error(
-                    "All {} variants failed for search config {} in experiment {} - continuing experiment",
+                    "All {} variants failed for search config {} in experiment {} with query '{}' - continuing experiment",
                     totalVariants,
                     searchConfigId,
-                    experimentId
+                    experimentId,
+                    queryText
                 );
                 transformedConfigToExperimentVariants.put("status", ExperimentBatchStatus.ALL_FAILED);
             } else if (failedVariants.get() > 0) {
                 log.warn(
-                    "Partial failure for search config {} in experiment {}: {}/{} variants succeeded",
+                    "Partial failure for search config {} in experiment {} with query '{}': {}/{} variants succeeded",
                     searchConfigId,
                     experimentId,
+                    queryText,
                     successfulVariants.get(),
                     totalVariants
                 );
