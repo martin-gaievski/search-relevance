@@ -9,20 +9,21 @@ package org.opensearch.searchrelevance.executors;
 
 import static org.opensearch.searchrelevance.executors.SearchRelevanceExecutor.SEARCH_RELEVANCE_EXEC_THREAD_POOL_NAME;
 
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.LongAdder;
 
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.cluster.block.ClusterBlockException;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.common.settings.Settings;
-import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.AbstractRunnable;
 import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import org.opensearch.core.action.ActionListener;
@@ -40,7 +41,7 @@ import com.google.common.annotations.VisibleForTesting;
 import lombok.extern.log4j.Log4j2;
 
 /**
- * Task manager for efficiently handling hybrid optimizer search tasks with concurrency control
+ * Class for managing tasks related to hybrid search
  */
 @Log4j2
 public class HybridSearchTaskManager {
@@ -52,8 +53,11 @@ public class HybridSearchTaskManager {
     protected static final String THREAD_POOL_EXECUTOR_NAME = ThreadPool.Names.GENERIC;
 
     private final int maxConcurrentTasks;
-    private final Map<String, ExperimentTaskContext> experimentTaskContexts = new HashMap<>();
+    private final ConcurrentHashMap<String, ExperimentTaskContext> experimentTaskContexts = new ConcurrentHashMap<>();
     private final Semaphore concurrencyControl;
+
+    // Use LongAdder for better concurrent counting performance
+    private final LongAdder activeTasks = new LongAdder();
 
     // Services
     private final Client client;
@@ -79,16 +83,16 @@ public class HybridSearchTaskManager {
         this.concurrencyControl = new Semaphore(maxConcurrentTasks, true);
 
         log.info(
-            "HybridSearchTaskManager initialized with max {} concurrent tasks (processors: {}) and dedicated SearchRelevance thread pool",
+            "HybridSearchTaskManagerOptimized initialized with max {} concurrent tasks (processors: {})",
             maxConcurrentTasks,
             ALLOCATED_PROCESSORS
         );
     }
 
     /**
-     * Schedule hybrid search tasks for execution with concurrency control
+     * Schedule hybrid search tasks using non-blocking mechanisms
      */
-    public void scheduleTasks(
+    public CompletableFuture<Map<String, Object>> scheduleTasksAsync(
         String experimentId,
         String searchConfigId,
         String index,
@@ -99,35 +103,37 @@ public class HybridSearchTaskManager {
         List<String> judgmentIds,
         Map<String, String> docIdToScores,
         Map<String, Object> configToExperimentVariants,
-        ActionListener<Map<String, Object>> finalListener,
         AtomicBoolean hasFailure
     ) {
-        // Create a context to track tasks for this experiment
-        ExperimentTaskContext taskContext = ExperimentTaskContext.builder()
-            .experimentId(experimentId)
-            .searchConfigId(searchConfigId)
-            .queryText(queryText)
-            .totalVariants(experimentVariants.size())
-            .configToExperimentVariants(configToExperimentVariants)
-            .finalListener(finalListener)
-            .hasFailure(hasFailure)
-            .experimentVariantDao(experimentVariantDao)
-            .build();
+        // Create a CompletableFuture to track the overall completion
+        CompletableFuture<Map<String, Object>> resultFuture = new CompletableFuture<>();
 
-        synchronized (experimentTaskContexts) {
-            experimentTaskContexts.put(experimentId, taskContext);
-        }
+        // Create optimized task context
+        ExperimentTaskContext taskContext = new ExperimentTaskContext(
+            experimentId,
+            searchConfigId,
+            queryText,
+            experimentVariants.size(),
+            new ConcurrentHashMap<>(configToExperimentVariants),
+            resultFuture,
+            hasFailure,
+            experimentVariantDao
+        );
 
-        synchronized (configToExperimentVariants) {
-            if (!configToExperimentVariants.containsKey(searchConfigId)) {
-                configToExperimentVariants.put(searchConfigId, new HashMap<String, Object>());
-            }
-        }
+        // Use putIfAbsent for atomic operation
+        experimentTaskContexts.putIfAbsent(experimentId, taskContext);
 
-        log.info("Scheduling {} hybrid search tasks for experiment {} with concurrency control", experimentVariants.size(), experimentId);
+        // Initialize config map using computeIfAbsent (non-blocking)
+        taskContext.getConfigToExperimentVariants().computeIfAbsent(searchConfigId, k -> new ConcurrentHashMap<String, Object>());
 
-        // Schedule each experiment variant as a separate task with concurrency control
-        for (ExperimentVariant experimentVariant : experimentVariants) {
+        log.info(
+            "Scheduling {} hybrid search tasks for experiment {} with non-blocking concurrency",
+            experimentVariants.size(),
+            experimentId
+        );
+
+        // Schedule tasks asynchronously
+        List<CompletableFuture<Void>> variantFutures = experimentVariants.stream().map(variant -> {
             VariantTaskParameters params = VariantTaskParameters.builder()
                 .experimentId(experimentId)
                 .searchConfigId(searchConfigId)
@@ -135,64 +141,91 @@ public class HybridSearchTaskManager {
                 .query(query)
                 .queryText(queryText)
                 .size(size)
-                .experimentVariant(experimentVariant)
+                .experimentVariant(variant)
                 .judgmentIds(judgmentIds)
                 .docIdToScores(docIdToScores)
                 .taskContext(taskContext)
                 .build();
-            
-            scheduleVariantTask(params);
-        }
+
+            return scheduleVariantTaskAsync(params);
+        }).toList();
+
+        // When all variants complete, clean up
+        CompletableFuture.allOf(variantFutures.toArray(new CompletableFuture[0])).whenComplete((v, ex) -> {
+            experimentTaskContexts.remove(experimentId);
+            activeTasks.decrement();
+        });
+
+        return resultFuture;
     }
 
     /**
-     * Schedule a single variant task for execution with proper backpressure control
+     * Schedule a single variant task asynchronously
      */
-    private void scheduleVariantTask(VariantTaskParameters params) {
+    private CompletableFuture<Void> scheduleVariantTaskAsync(VariantTaskParameters params) {
+        CompletableFuture<Void> future = new CompletableFuture<>();
+
         if (params.getTaskContext().getHasFailure().get()) {
-            return;
+            future.complete(null);
+            return future;
         }
 
-        // Try to acquire semaphore permit BEFORE submitting to thread pool
+        // Try to acquire permit non-blocking
         if (concurrencyControl.tryAcquire()) {
-            try {
-                threadPool.executor(SEARCH_RELEVANCE_EXEC_THREAD_POOL_NAME).execute(new VariantTaskRunnable(params));
-            } catch (RejectedExecutionException rejectedExecutionException) {
-                // Thread pool queue is full, release permit and retry with backpressure
-                concurrencyControl.release();
-                log.warn("Thread pool queue full, scheduling with backpressure for variant: {}", params.getExperimentVariant().getId());
-                scheduleWithBackpressure(params);
-            }
+            activeTasks.increment();
+            submitTaskToThreadPool(params, future);
         } else {
-            // No permit available - schedule with backpressure
-            scheduleWithBackpressure(params);
+            // Schedule with backpressure using CompletableFuture
+            CompletableFuture.delayedExecutor(
+                TASK_RETRY_DELAY_MILLISECONDS,
+                TimeUnit.MILLISECONDS,
+                threadPool.executor(THREAD_POOL_EXECUTOR_NAME)
+            ).execute(() -> {
+                scheduleVariantTaskAsync(params).whenComplete((v, ex) -> {
+                    if (ex != null) {
+                        future.completeExceptionally(ex);
+                    } else {
+                        future.complete(v);
+                    }
+                });
+            });
+        }
+
+        return future;
+    }
+
+    private void submitTaskToThreadPool(VariantTaskParameters params, CompletableFuture<Void> future) {
+        try {
+            threadPool.executor(SEARCH_RELEVANCE_EXEC_THREAD_POOL_NAME).execute(new OptimizedVariantTaskRunnable(params, future));
+        } catch (RejectedExecutionException e) {
+            concurrencyControl.release();
+            activeTasks.decrement();
+            log.warn("Thread pool queue full, retrying for variant: {}", params.getExperimentVariant().getId());
+
+            // Retry with backpressure
+            CompletableFuture.delayedExecutor(
+                TASK_RETRY_DELAY_MILLISECONDS,
+                TimeUnit.MILLISECONDS,
+                threadPool.executor(THREAD_POOL_EXECUTOR_NAME)
+            ).execute(() -> scheduleVariantTaskAsync(params));
         }
     }
 
     /**
-     * Schedule task with backpressure when concurrency limit is reached
+     * Execute variant task using CompletableFuture for better async handling
      */
-    private void scheduleWithBackpressure(VariantTaskParameters params) {
-        log.debug("Concurrency limit reached. Scheduling task with backpressure for variant: {}", params.getExperimentVariant().getId());
-
-        threadPool.schedule(
-            () -> scheduleVariantTask(params),
-            new TimeValue(TASK_RETRY_DELAY_MILLISECONDS, TimeUnit.MILLISECONDS),
-            THREAD_POOL_EXECUTOR_NAME
-        );
-    }
-
-    /**
-     * Execute the variant task with acquired semaphore permit
-     */
-    private void executeVariantTaskWithPermit(VariantTaskParameters params) {
+    private void executeVariantTaskAsync(VariantTaskParameters params, CompletableFuture<Void> future) {
         if (params.getTaskContext().getHasFailure().get()) {
             concurrencyControl.release();
+            activeTasks.decrement();
+            future.complete(null);
             return;
         }
 
         final String evaluationId = UUID.randomUUID().toString();
-        Map<String, Object> temporarySearchPipeline = QuerySourceUtil.createDefinitionOfTemporarySearchPipeline(params.getExperimentVariant());
+        Map<String, Object> temporarySearchPipeline = QuerySourceUtil.createDefinitionOfTemporarySearchPipeline(
+            params.getExperimentVariant()
+        );
 
         SearchRequest searchRequest = SearchRequestBuilder.buildRequestForHybridSearch(
             params.getIndex(),
@@ -202,39 +235,56 @@ public class HybridSearchTaskManager {
             params.getSize()
         );
 
-        log.debug(
-            "Processing hybrid search sub-experiment: {} configuration: {} index: {}, query: {}, evaluationId: {}",
-            params.getExperimentVariant().getId(),
-            params.getSearchConfigId(),
-            params.getIndex(),
-            params.getQuery(),
-            evaluationId
-        );
+        // Convert ActionListener to CompletableFuture
+        CompletableFuture<Void> searchFuture = new CompletableFuture<>();
 
-        client.search(searchRequest, ActionListener.wrap(response -> {
-            try {
-                searchResponseProcessor.processSearchResponse(
-                    response,
-                    params.getExperimentVariant(),
-                    params.getExperimentId(),
-                    params.getSearchConfigId(),
-                    params.getQueryText(),
-                    params.getSize(),
-                    params.getJudgmentIds(),
-                    params.getDocIdToScores(),
-                    evaluationId,
-                    params.getTaskContext()
-                );
-            } finally {
-                concurrencyControl.release();
+        client.search(searchRequest, new ActionListener<>() {
+            @Override
+            public void onResponse(org.opensearch.action.search.SearchResponse response) {
+                try {
+                    searchResponseProcessor.processSearchResponse(
+                        response,
+                        params.getExperimentVariant(),
+                        params.getExperimentId(),
+                        params.getSearchConfigId(),
+                        params.getQueryText(),
+                        params.getSize(),
+                        params.getJudgmentIds(),
+                        params.getDocIdToScores(),
+                        evaluationId,
+                        params.getTaskContext()
+                    );
+                    searchFuture.complete(null);
+                } catch (Exception e) {
+                    searchFuture.completeExceptionally(e);
+                } finally {
+                    concurrencyControl.release();
+                    activeTasks.decrement();
+                }
             }
-        }, exception -> {
-            try {
-                handleSearchFailure(exception, params.getExperimentVariant(), params.getExperimentId(), evaluationId, params.getTaskContext());
-            } finally {
-                concurrencyControl.release();
+
+            @Override
+            public void onFailure(Exception e) {
+                try {
+                    handleSearchFailure(e, params.getExperimentVariant(), params.getExperimentId(), evaluationId, params.getTaskContext());
+                    searchFuture.complete(null);
+                } catch (Exception ex) {
+                    searchFuture.completeExceptionally(ex);
+                } finally {
+                    concurrencyControl.release();
+                    activeTasks.decrement();
+                }
             }
-        }));
+        });
+
+        // Chain the futures
+        searchFuture.whenComplete((v, ex) -> {
+            if (ex != null) {
+                future.completeExceptionally(ex);
+            } else {
+                future.complete(null);
+            }
+        });
     }
 
     private void handleSearchFailure(
@@ -244,34 +294,22 @@ public class HybridSearchTaskManager {
         String evaluationId,
         ExperimentTaskContext taskContext
     ) {
-        // Check if this is a critical system failure vs individual variant failure
         if (isCriticalSystemFailure(e)) {
             if (taskContext.getHasFailure().compareAndSet(false, true)) {
-                log.error(
-                    "Critical system failure processing hybrid search task for variant {}: {}",
-                    experimentVariant.getId(),
-                    e.getMessage()
-                );
-                taskContext.getFinalListener().onFailure(e);
+                log.error("Critical system failure for variant {}: {}", experimentVariant.getId(), e.getMessage());
+                taskContext.getResultFuture().completeExceptionally(e);
             }
         } else {
-            // Treat as individual variant failure - don't stop entire experiment
             searchResponseProcessor.handleSearchFailure(e, experimentVariant, experimentId, evaluationId, taskContext);
         }
     }
 
-    /**
-     * Determine if a throwable represents a critical system failure that should stop the entire experiment
-     * vs an individual variant failure that should be recorded but not stop processing
-     */
     private boolean isCriticalSystemFailure(Throwable throwable) {
         Throwable current = throwable;
         while (current != null) {
-            // Critical system errors that should stop the experiment
             if (current instanceof OutOfMemoryError || current instanceof StackOverflowError) {
                 return true;
             }
-            // Check for OpenSearch-specific critical exceptions
             if (current instanceof CircuitBreakingException || current instanceof ClusterBlockException) {
                 return true;
             }
@@ -281,66 +319,71 @@ public class HybridSearchTaskManager {
     }
 
     /**
-     * Get current concurrency metrics for monitoring
+     * Get current concurrency metrics
      */
     @VisibleForTesting
     protected Map<String, Object> getConcurrencyMetrics() {
-        Map<String, Object> metrics = new HashMap<>();
-        metrics.put("active_experiments", experimentTaskContexts.size());
-        metrics.put("max_concurrent_tasks", maxConcurrentTasks);
-        metrics.put("available_permits", concurrencyControl.availablePermits());
-        metrics.put("queued_threads", concurrencyControl.getQueueLength());
-        metrics.put("thread_pool", SEARCH_RELEVANCE_EXEC_THREAD_POOL_NAME);
-        return metrics;
+        return Map.of(
+            "active_experiments",
+            experimentTaskContexts.size(),
+            "active_tasks",
+            activeTasks.sum(),
+            "max_concurrent_tasks",
+            maxConcurrentTasks,
+            "available_permits",
+            concurrencyControl.availablePermits(),
+            "queued_threads",
+            concurrencyControl.getQueueLength(),
+            "thread_pool",
+            SEARCH_RELEVANCE_EXEC_THREAD_POOL_NAME
+        );
     }
 
     /**
-     * Runnable for executing variant tasks
+     * Optimized runnable using CompletableFuture
      */
-    private class VariantTaskRunnable extends AbstractRunnable {
+    private class OptimizedVariantTaskRunnable extends AbstractRunnable {
         private final VariantTaskParameters params;
+        private final CompletableFuture<Void> future;
 
-        VariantTaskRunnable(VariantTaskParameters params) {
+        OptimizedVariantTaskRunnable(VariantTaskParameters params, CompletableFuture<Void> future) {
             this.params = params;
+            this.future = future;
         }
 
         @Override
         public void onFailure(Exception e) {
             concurrencyControl.release();
+            activeTasks.decrement();
 
-            // Check if it's a rejected execution (queue full)
             if (e.getCause() instanceof RejectedExecutionException) {
                 log.warn("Thread pool queue full, retrying task for variant: {}", params.getExperimentVariant().getId());
-                scheduleWithBackpressure(params);
+                scheduleVariantTaskAsync(params).whenComplete((v, ex) -> {
+                    if (ex != null) {
+                        future.completeExceptionally(ex);
+                    } else {
+                        future.complete(v);
+                    }
+                });
             } else {
                 handleTaskFailure(params.getExperimentVariant(), e, params.getTaskContext());
+                future.completeExceptionally(e);
             }
         }
 
         @Override
         protected void doRun() {
-            try {
-                executeVariantTaskWithPermit(params);
-            } catch (Exception exception) {
-                concurrencyControl.release();
-                throw exception;
-            }
+            executeVariantTaskAsync(params, future);
         }
     }
 
     private void handleTaskFailure(ExperimentVariant experimentVariant, Exception e, ExperimentTaskContext taskContext) {
-        // Check if this is a critical system failure vs individual variant failure
         if (isCriticalSystemFailure(e)) {
             if (taskContext.getHasFailure().compareAndSet(false, true)) {
-                log.error(
-                    "Critical system failure processing hybrid search task for variant {}: {}",
-                    experimentVariant.getId(),
-                    e.getMessage()
-                );
-                taskContext.getFinalListener().onFailure(e);
+                log.error("Critical system failure for variant {}: {}", experimentVariant.getId(), e.getMessage());
+                taskContext.getResultFuture().completeExceptionally(e);
             }
         } else {
-            // Treat as individual variant failure - don't stop entire experiment
             log.error("Variant failure for {}: {}", experimentVariant.getId(), e.getMessage());
             taskContext.completeVariantFailure();
         }

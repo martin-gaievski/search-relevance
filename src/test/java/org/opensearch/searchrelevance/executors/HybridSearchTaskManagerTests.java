@@ -16,6 +16,7 @@ import static org.mockito.Mockito.when;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -262,5 +263,34 @@ public class HybridSearchTaskManagerTests extends OpenSearchTestCase {
             // Medium systems should scale with processor count / 2
             assertEquals("Medium systems should scale as processors/2", actualProcessors / 2, maxConcurrentTasks);
         }
+    }
+
+    public void testConfigMapInitialization() throws Exception {
+        // Arrange
+        HybridSearchTaskManager taskManager = new HybridSearchTaskManager(client, evaluationResultDao, experimentVariantDao, threadPool);
+        String experimentId = "test-experiment";
+        String searchConfigId = "test-config";
+        Map<String, Object> initialConfigMap = new HashMap<>();
+        initialConfigMap.put("existing-key", "existing-value");
+
+        // Act
+        CompletableFuture<Map<String, Object>> future = taskManager.scheduleTasksAsync(
+            experimentId,
+            searchConfigId,
+            "test-index",
+            "test-query",
+            "test query text",
+            10,
+            createTestVariants(experimentId, 1),
+            List.of("judgment-1"),
+            Map.of("doc1", "5"),
+            initialConfigMap,
+            new AtomicBoolean(false)
+        );
+
+        // Assert
+        assertNotNull("Should return a CompletableFuture", future);
+        // The initial config map should be preserved
+        assertTrue("Should preserve existing keys", initialConfigMap.containsKey("existing-key"));
     }
 }

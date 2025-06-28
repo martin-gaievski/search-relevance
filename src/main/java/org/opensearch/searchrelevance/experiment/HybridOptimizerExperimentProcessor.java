@@ -18,9 +18,9 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.core.action.ActionListener;
@@ -34,7 +34,7 @@ import org.opensearch.searchrelevance.utils.TimeUtils;
 import lombok.extern.log4j.Log4j2;
 
 /**
- * Processor for handling HYBRID_OPTIMIZER experiments with asynchronous task management
+ * Processor for handling HYBRID_OPTIMIZER experiments with non-blocking async operations
  */
 @Log4j2
 public class HybridOptimizerExperimentProcessor {
@@ -48,7 +48,7 @@ public class HybridOptimizerExperimentProcessor {
     }
 
     /**
-     * Process hybrid optimizer experiment using task queue
+     * Process hybrid optimizer experiment using non-blocking async operations
      *
      * @param experimentId Experiment ID
      * @param queryText Query text to process
@@ -81,6 +81,7 @@ public class HybridOptimizerExperimentProcessor {
             experimentVariantDTOs.size(),
             queryText
         );
+
         for (ExperimentVariantHybridSearchDTO experimentVariantDTO : experimentVariantDTOs) {
             Map<String, Object> parameters = new HashMap<>(
                 Map.of(
@@ -113,22 +114,12 @@ public class HybridOptimizerExperimentProcessor {
             experimentVariants.size()
         );
 
-        // Process experiment variants for each search configuration
-        Map<String, Object> hydratedResults = new ConcurrentHashMap<>();
-
-        try {
-            // Get document scores from judgments synchronously
-            List<SearchResponse> judgmentResponses = new ArrayList<>();
-            for (String judgmentId : judgmentList) {
-                SearchResponse judgmentResponse = judgmentDao.getJudgmentSync(judgmentId);
-                judgmentResponses.add(judgmentResponse);
-            }
-
-            Map<String, String> docIdToScores = processJudgments(queryText, judgmentResponses);
+        // Process judgments asynchronously
+        processJudgmentsAsync(queryText, judgmentList).thenAccept(docIdToScores -> {
             log.info("Processing search configurations for query '{}' with {} document ratings", queryText, docIdToScores.size());
 
-            // Process search configurations with task manager
-            processSearchConfigurations(
+            // Process search configurations with optimized task manager
+            processSearchConfigurationsAsync(
                 experimentId,
                 queryText,
                 indexAndQueries,
@@ -136,66 +127,80 @@ public class HybridOptimizerExperimentProcessor {
                 size,
                 experimentVariants,
                 docIdToScores,
-                hydratedResults,
                 hasFailure,
                 listener
             );
-        } catch (Exception e) {
+        }).exceptionally(e -> {
             if (hasFailure.compareAndSet(false, true)) {
-                listener.onFailure(e);
+                listener.onFailure(new Exception("Failed to process judgments", e));
             }
-        }
+            return null;
+        });
     }
 
     /**
-     * Process judgments to extract document scores from SearchResponse objects (synchronous)
+     * Process judgments asynchronously using CompletableFuture
      */
-    private Map<String, String> processJudgments(String queryText, List<SearchResponse> judgmentResponses) {
-        log.info("Processing {} judgment responses for query: {}", judgmentResponses.size(), queryText);
+    private CompletableFuture<Map<String, String>> processJudgmentsAsync(String queryText, List<String> judgmentList) {
+        log.info("Processing {} judgments for query: {}", judgmentList.size(), queryText);
 
-        Map<String, String> docIdToScores = new HashMap<>();
+        List<CompletableFuture<SearchResponse>> judgmentFutures = judgmentList.stream().map(judgmentId -> {
+            CompletableFuture<SearchResponse> future = new CompletableFuture<>();
+            judgmentDao.getJudgment(judgmentId, ActionListener.wrap(future::complete, future::completeExceptionally));
+            return future;
+        }).toList();
 
-        for (SearchResponse judgmentResponse : judgmentResponses) {
-            try {
-                if (judgmentResponse.getHits().getTotalHits().value() == 0) {
-                    log.warn("No judgment found in response");
-                } else {
-                    Map<String, Object> sourceAsMap = judgmentResponse.getHits().getHits()[0].getSourceAsMap();
-                    List<Map<String, Object>> judgmentRatings = (List<Map<String, Object>>) sourceAsMap.getOrDefault(
-                        "judgmentRatings",
-                        Collections.emptyList()
-                    );
-
-                    for (Map<String, Object> rating : judgmentRatings) {
-                        if (queryText.equals(rating.get("query"))) {
-                            List<Map<String, String>> docScoreRatings = (List<Map<String, String>>) rating.get("ratings");
-                            if (docScoreRatings != null) {
-                                docScoreRatings.forEach(
-                                    docScoreRating -> docIdToScores.put(docScoreRating.get("docId"), docScoreRating.get("rating"))
-                                );
-                            }
-                            break;
-                        }
-                    }
+        return CompletableFuture.allOf(judgmentFutures.toArray(new CompletableFuture[0])).thenApply(v -> {
+            Map<String, String> docIdToScores = new HashMap<>();
+            for (CompletableFuture<SearchResponse> future : judgmentFutures) {
+                try {
+                    SearchResponse response = future.join();
+                    extractJudgmentScores(queryText, response, docIdToScores);
+                } catch (Exception e) {
+                    log.error("Failed to process judgment response: {}", e.getMessage());
                 }
-            } catch (Exception e) {
-                log.error("Failed to process judgment response: {}", e.getMessage());
             }
-        }
 
-        if (docIdToScores.isEmpty()) {
-            log.warn("No ratings found for query: {} in any judgment responses", queryText);
-        } else {
-            log.info("Found {} document ratings for query: {}", docIdToScores.size(), queryText);
-        }
+            if (docIdToScores.isEmpty()) {
+                log.warn("No ratings found for query: {} in any judgment responses", queryText);
+            } else {
+                log.info("Found {} document ratings for query: {}", docIdToScores.size(), queryText);
+            }
 
-        return docIdToScores;
+            return docIdToScores;
+        });
     }
 
     /**
-     * Process search configurations using task manager
+     * Extract judgment scores from SearchResponse
      */
-    private void processSearchConfigurations(
+    private void extractJudgmentScores(String queryText, SearchResponse response, Map<String, String> docIdToScores) {
+        if (response.getHits().getTotalHits().value() == 0) {
+            log.warn("No judgment found in response");
+            return;
+        }
+
+        Map<String, Object> sourceAsMap = response.getHits().getHits()[0].getSourceAsMap();
+        List<Map<String, Object>> judgmentRatings = (List<Map<String, Object>>) sourceAsMap.getOrDefault(
+            "judgmentRatings",
+            Collections.emptyList()
+        );
+
+        for (Map<String, Object> rating : judgmentRatings) {
+            if (queryText.equals(rating.get("query"))) {
+                List<Map<String, String>> docScoreRatings = (List<Map<String, String>>) rating.get("ratings");
+                if (docScoreRatings != null) {
+                    docScoreRatings.forEach(docScoreRating -> docIdToScores.put(docScoreRating.get("docId"), docScoreRating.get("rating")));
+                }
+                break;
+            }
+        }
+    }
+
+    /**
+     * Process search configurations using optimized task manager
+     */
+    private void processSearchConfigurationsAsync(
         String experimentId,
         String queryText,
         Map<String, List<String>> indexAndQueries,
@@ -203,22 +208,22 @@ public class HybridOptimizerExperimentProcessor {
         int size,
         List<ExperimentVariant> experimentVariants,
         Map<String, String> docIdToScores,
-        Map<String, Object> hydratedResults,
         AtomicBoolean hasFailure,
         ActionListener<Map<String, Object>> finalListener
     ) {
-        // Count for search configurations
-        AtomicInteger pendingConfigurations = new AtomicInteger(indexAndQueries.size());
+        Map<String, Object> hydratedResults = new ConcurrentHashMap<>();
         List<Map<String, Object>> queryResults = Collections.synchronizedList(new ArrayList<>());
 
-        // Process each search configuration
+        // Create futures for each search configuration
+        List<CompletableFuture<Map<String, Object>>> configFutures = new ArrayList<>();
+
         for (Map.Entry<String, List<String>> entry : indexAndQueries.entrySet()) {
             String searchConfigId = entry.getKey();
             String index = entry.getValue().get(0);
             String query = entry.getValue().get(1);
 
-            // Use task manager to process variants for this search config
-            taskManager.scheduleTasks(
+            // Use optimized task manager to process variants
+            CompletableFuture<Map<String, Object>> configFuture = taskManager.scheduleTasksAsync(
                 experimentId,
                 searchConfigId,
                 index,
@@ -229,47 +234,36 @@ public class HybridOptimizerExperimentProcessor {
                 judgmentList,
                 docIdToScores,
                 hydratedResults,
-                new ActionListener<>() {
-                    @Override
-                    public void onResponse(Map<String, Object> results) {
-                        try {
-                            // Extract evaluation results and format them for the experiment
-                            List<Map<String, Object>> evaluationResults = (List<Map<String, Object>>) results.get("evaluationResults");
-
-                            synchronized (queryResults) {
-                                // Create one result entry for this search configuration with all evaluation results
-                                if (evaluationResults != null && !evaluationResults.isEmpty()) {
-                                    Map<String, Object> searchConfigResult = new HashMap<>();
-                                    searchConfigResult.put(POINTWISE_FIELD_NAME_SEARCH_CONFIGURATION_ID, searchConfigId);
-                                    searchConfigResult.put("evaluationResults", new ArrayList<>(evaluationResults));
-                                    // queryText will be added by handleQueryResults
-                                    queryResults.add(searchConfigResult);
-                                }
-
-                                // Check if all search configurations for this query are complete
-                                if (pendingConfigurations.decrementAndGet() == 0) {
-                                    // All search configurations processed, return results for this query
-                                    Map<String, Object> queryResponse = new HashMap<>();
-                                    queryResponse.put("searchConfigurationResults", new ArrayList<>(queryResults));
-                                    finalListener.onResponse(queryResponse);
-                                }
-                            }
-                        } catch (Exception e) {
-                            if (hasFailure.compareAndSet(false, true)) {
-                                finalListener.onFailure(e);
-                            }
-                        }
-                    }
-
-                    @Override
-                    public void onFailure(Exception e) {
-                        if (hasFailure.compareAndSet(false, true)) {
-                            finalListener.onFailure(e);
-                        }
-                    }
-                },
                 hasFailure
             );
+
+            // Transform the result for this search configuration
+            CompletableFuture<Map<String, Object>> transformedFuture = configFuture.thenApply(results -> {
+                List<Map<String, Object>> evaluationResults = (List<Map<String, Object>>) results.get("evaluationResults");
+
+                if (evaluationResults != null && !evaluationResults.isEmpty()) {
+                    Map<String, Object> searchConfigResult = new HashMap<>();
+                    searchConfigResult.put(POINTWISE_FIELD_NAME_SEARCH_CONFIGURATION_ID, searchConfigId);
+                    searchConfigResult.put("evaluationResults", new ArrayList<>(evaluationResults));
+                    queryResults.add(searchConfigResult);
+                }
+
+                return results;
+            });
+
+            configFutures.add(transformedFuture);
         }
+
+        // Wait for all configurations to complete
+        CompletableFuture.allOf(configFutures.toArray(new CompletableFuture[0])).thenAccept(v -> {
+            Map<String, Object> queryResponse = new HashMap<>();
+            queryResponse.put("searchConfigurationResults", new ArrayList<>(queryResults));
+            finalListener.onResponse(queryResponse);
+        }).exceptionally(e -> {
+            if (hasFailure.compareAndSet(false, true)) {
+                finalListener.onFailure(new Exception("Failed to process search configurations", e));
+            }
+            return null;
+        });
     }
 }

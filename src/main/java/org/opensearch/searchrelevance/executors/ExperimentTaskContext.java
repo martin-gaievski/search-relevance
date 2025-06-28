@@ -7,9 +7,12 @@
  */
 package org.opensearch.searchrelevance.executors;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -18,9 +21,7 @@ import org.opensearch.searchrelevance.dao.ExperimentVariantDao;
 import org.opensearch.searchrelevance.model.ExperimentBatchStatus;
 import org.opensearch.searchrelevance.model.ExperimentVariant;
 
-import lombok.Builder;
 import lombok.Getter;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.log4j.Log4j2;
 
 /**
@@ -33,23 +34,22 @@ public class ExperimentTaskContext {
     private final String searchConfigId;
     private final String queryText;
     private final int totalVariants;
-    private final Map<String, Object> configToExperimentVariants;
-    private final ActionListener<Map<String, Object>> finalListener;
+    private final ConcurrentHashMap<String, Object> configToExperimentVariants;
+    private final CompletableFuture<Map<String, Object>> resultFuture;
     private final AtomicBoolean hasFailure;
     private final ExperimentVariantDao experimentVariantDao;
-    
-    private final AtomicInteger remainingVariants;
-    private final AtomicInteger successfulVariants = new AtomicInteger(0);
-    private final AtomicInteger failedVariants = new AtomicInteger(0);
 
-    @Builder
+    private final AtomicInteger remainingVariants;
+    private final AtomicInteger successfulVariants;
+    private final AtomicInteger failedVariants;
+
     public ExperimentTaskContext(
         String experimentId,
         String searchConfigId,
         String queryText,
         int totalVariants,
-        Map<String, Object> configToExperimentVariants,
-        ActionListener<Map<String, Object>> finalListener,
+        ConcurrentHashMap<String, Object> configToExperimentVariants,
+        CompletableFuture<Map<String, Object>> resultFuture,
         AtomicBoolean hasFailure,
         ExperimentVariantDao experimentVariantDao
     ) {
@@ -58,29 +58,33 @@ public class ExperimentTaskContext {
         this.queryText = queryText;
         this.totalVariants = totalVariants;
         this.configToExperimentVariants = configToExperimentVariants;
-        this.finalListener = finalListener;
+        this.resultFuture = resultFuture;
         this.hasFailure = hasFailure;
         this.experimentVariantDao = experimentVariantDao;
         this.remainingVariants = new AtomicInteger(totalVariants);
-        
+        this.successfulVariants = new AtomicInteger(0);
+        this.failedVariants = new AtomicInteger(0);
+
         log.info("TaskContext initialized for experiment {} with {} variants", experimentId, totalVariants);
     }
 
     /**
-     * Write a variant individually using efficient refresh policy
+     * Non-blocking variant write
      */
     public void scheduleVariantWrite(ExperimentVariant variant, String evaluationId, boolean isSuccess) {
-        experimentVariantDao.putExperimentVariantEfficient(variant, ActionListener.wrap(response -> {
-            log.debug("write successful for variant: {}", variant.getId());
-            if (isSuccess) {
-                synchronized (configToExperimentVariants) {
-                    Map<String, Object> map = (Map<String, Object>) configToExperimentVariants.get(searchConfigId);
-                    map.put(variant.getId(), evaluationId);
+        CompletableFuture.runAsync(() -> {
+            experimentVariantDao.putExperimentVariantEfficient(variant, ActionListener.wrap(response -> {
+                log.debug("write successful for variant: {}", variant.getId());
+                if (isSuccess) {
+                    ConcurrentHashMap<String, Object> map = (ConcurrentHashMap<String, Object>) configToExperimentVariants.get(
+                        searchConfigId
+                    );
+                    if (map != null) {
+                        map.put(variant.getId(), evaluationId);
+                    }
                 }
-            }
-        }, error -> { 
-            log.error("write failed for variant {}: {}", variant.getId(), error.getMessage()); 
-        }));
+            }, error -> { log.error("write failed for variant {}: {}", variant.getId(), error.getMessage()); }));
+        });
     }
 
     /**
@@ -111,21 +115,20 @@ public class ExperimentTaskContext {
     /**
      * Finish the experiment and send final response
      */
-    protected void finishExperiment() {
-        // Create results even if all variants failed (non-fatal to experiment)
+    private void finishExperiment() {
         Map<String, Object> transformedConfigToExperimentVariants = new HashMap<>();
         transformedConfigToExperimentVariants.put("searchConfigurationId", searchConfigId);
 
         List<Map<String, Object>> evaluationResults = formatEvaluationResults();
         transformedConfigToExperimentVariants.put("evaluationResults", evaluationResults);
 
-        // Add failure summary
         Map<String, Object> summary = new HashMap<>();
         summary.put("totalVariants", totalVariants);
         summary.put("successfulVariants", successfulVariants.get());
         summary.put("failedVariants", failedVariants.get());
         transformedConfigToExperimentVariants.put("summary", summary);
 
+        ExperimentBatchStatus status;
         if (failedVariants.get() == totalVariants) {
             log.error(
                 "All {} variants failed for search config {} in experiment {} with query '{}' - continuing experiment",
@@ -134,7 +137,7 @@ public class ExperimentTaskContext {
                 experimentId,
                 queryText
             );
-            transformedConfigToExperimentVariants.put("status", ExperimentBatchStatus.ALL_FAILED);
+            status = ExperimentBatchStatus.ALL_FAILED;
         } else if (failedVariants.get() > 0) {
             log.warn(
                 "Partial failure for search config {} in experiment {} with query '{}': {}/{} variants succeeded",
@@ -144,28 +147,32 @@ public class ExperimentTaskContext {
                 successfulVariants.get(),
                 totalVariants
             );
-            transformedConfigToExperimentVariants.put("status", ExperimentBatchStatus.PARTIAL_SUCCESS);
+            status = ExperimentBatchStatus.PARTIAL_SUCCESS;
         } else {
-            transformedConfigToExperimentVariants.put("status", ExperimentBatchStatus.SUCCESS);
+            status = ExperimentBatchStatus.SUCCESS;
         }
 
-        // continue, don't fail the entire experiment for one search config
-        finalListener.onResponse(transformedConfigToExperimentVariants);
+        transformedConfigToExperimentVariants.put("status", status);
+
+        // Complete the future with the results
+        resultFuture.complete(transformedConfigToExperimentVariants);
     }
 
     /**
      * Format evaluation results for the final response
      */
     private List<Map<String, Object>> formatEvaluationResults() {
-        List<Map<String, Object>> results = new java.util.ArrayList<>();
-        Map<String, Object> configMap = (Map<String, Object>) configToExperimentVariants.get(searchConfigId);
+        List<Map<String, Object>> results = new ArrayList<>();
+        ConcurrentHashMap<String, Object> configMap = (ConcurrentHashMap<String, Object>) configToExperimentVariants.get(searchConfigId);
 
-        configMap.forEach((variantId, evalId) -> {
-            Map<String, Object> result = new HashMap<>();
-            result.put("evaluationId", evalId);
-            result.put("experimentVariantId", variantId);
-            results.add(result);
-        });
+        if (configMap != null) {
+            configMap.forEach((variantId, evalId) -> {
+                Map<String, Object> result = new HashMap<>();
+                result.put("evaluationId", evalId);
+                result.put("experimentVariantId", variantId);
+                results.add(result);
+            });
+        }
 
         return results;
     }
