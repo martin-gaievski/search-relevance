@@ -129,6 +129,40 @@ public class SearchRelevanceIndicesManager {
         final SearchRelevanceIndices index,
         final ActionListener<?> listener
     ) {
+        putDocWithRefreshPolicy(docId, xContentBuilder, index, WriteRequest.RefreshPolicy.IMMEDIATE, listener);
+    }
+
+    /**
+     * Put a doc to the system index with efficient refresh policy (recommended for experiments)
+     * @param docId - document id need to be executed
+     * @param xContentBuilder - content need to be executed
+     * @param index - system index
+     * @param listener - action lister for async action
+     */
+    public void putDocEfficient(
+        final String docId,
+        final XContentBuilder xContentBuilder,
+        final SearchRelevanceIndices index,
+        final ActionListener<?> listener
+    ) {
+        putDocWithRefreshPolicy(docId, xContentBuilder, index, WriteRequest.RefreshPolicy.WAIT_UNTIL, listener);
+    }
+
+    /**
+     * Put a doc to the system index with specified refresh policy
+     * @param docId - document id need to be executed
+     * @param xContentBuilder - content need to be executed
+     * @param index - system index
+     * @param refreshPolicy - refresh policy to use
+     * @param listener - action lister for async action
+     */
+    public void putDocWithRefreshPolicy(
+        final String docId,
+        final XContentBuilder xContentBuilder,
+        final SearchRelevanceIndices index,
+        final WriteRequest.RefreshPolicy refreshPolicy,
+        final ActionListener<?> listener
+    ) {
         SearchOperationContext searchOperationContext = SearchOperationContext.builder()
             .documentId(docId)
             .xContentBuilder(xContentBuilder)
@@ -141,7 +175,7 @@ public class SearchRelevanceIndicesManager {
                 client.prepareIndex(context.getIndex().getIndexName())
                     .setId(context.getDocumentId())
                     .setOpType(OpType.CREATE)
-                    .setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE)
+                    .setRefreshPolicy(refreshPolicy)
                     .setSource(context.getXContentBuilder())
                     .execute(typedListener);
             } catch (Exception e) {
@@ -164,6 +198,40 @@ public class SearchRelevanceIndicesManager {
         final SearchRelevanceIndices index,
         final ActionListener listener
     ) {
+        updateDocWithRefreshPolicy(docId, xContentBuilder, index, WriteRequest.RefreshPolicy.IMMEDIATE, listener);
+    }
+
+    /**
+     * Update a doc to the system index with efficient refresh policy (recommended for experiments)
+     * @param docId - document id need to be executed
+     * @param xContentBuilder - content need to be executed
+     * @param index - system index
+     * @param listener - action lister for async action
+     */
+    public void updateDocEfficient(
+        final String docId,
+        final XContentBuilder xContentBuilder,
+        final SearchRelevanceIndices index,
+        final ActionListener listener
+    ) {
+        updateDocWithRefreshPolicy(docId, xContentBuilder, index, WriteRequest.RefreshPolicy.WAIT_UNTIL, listener);
+    }
+
+    /**
+     * Update a doc to the system index with specified refresh policy
+     * @param docId - document id need to be executed
+     * @param xContentBuilder - content need to be executed
+     * @param index - system index
+     * @param refreshPolicy - refresh policy to use
+     * @param listener - action lister for async action
+     */
+    public void updateDocWithRefreshPolicy(
+        final String docId,
+        final XContentBuilder xContentBuilder,
+        final SearchRelevanceIndices index,
+        final WriteRequest.RefreshPolicy refreshPolicy,
+        final ActionListener listener
+    ) {
         SearchOperationContext searchOperationContext = SearchOperationContext.builder()
             .index(index)
             .xContentBuilder(xContentBuilder)
@@ -175,7 +243,7 @@ public class SearchRelevanceIndicesManager {
                     client.prepareIndex(searchOperationContext1.getIndex().getIndexName())
                         .setId(searchOperationContext1.getDocumentId())
                         .setOpType(OpType.INDEX)
-                        .setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE)
+                        .setRefreshPolicy(refreshPolicy)
                         .setSource(searchOperationContext1.getXContentBuilder())
                         .execute((ActionListener) actionListener);
                 } catch (Exception e) {
