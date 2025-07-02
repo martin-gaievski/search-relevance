@@ -4,10 +4,22 @@ Inspired from [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased]
 
-### Added
+### Breaking Changes
 
-### Removed
+### Features
 
-### Fixed
+### Enhancements
+* Added tasks scheduling and management mechanism for hybrid optimizer experiments ([#139](https://github.com/opensearch-project/search-relevance/pull/139))
+
+### Bug Fixes
+
+### Infrastructure
+* Added end to end integration tests for experiments ([#154](https://github.com/opensearch-project/search-relevance/pull/154))
 
 ### Security
+
+### Documentation
+
+### Maintenance
+
+### Refactoring
