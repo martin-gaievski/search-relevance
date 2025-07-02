@@ -12,7 +12,7 @@ import static org.opensearch.searchrelevance.executors.SearchRelevanceExecutor.S
 import org.opensearch.common.settings.Settings;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.threadpool.ExecutorBuilder;
-import org.opensearch.threadpool.FixedExecutorBuilder;
+import org.opensearch.threadpool.ScalingExecutorBuilder;
 import org.opensearch.threadpool.TestThreadPool;
 
 public class SearchRelevanceExecutorTests extends OpenSearchTestCase {
@@ -23,7 +23,7 @@ public class SearchRelevanceExecutorTests extends OpenSearchTestCase {
         ExecutorBuilder<?> executorBuilder = SearchRelevanceExecutor.getExecutorBuilder(settings);
 
         assertNotNull(executorBuilder);
-        assertTrue(executorBuilder instanceof FixedExecutorBuilder);
+        assertTrue(executorBuilder instanceof ScalingExecutorBuilder);
     }
 
     public void testGetExecutorBuilderWithMinThreadSize() {
@@ -32,7 +32,7 @@ public class SearchRelevanceExecutorTests extends OpenSearchTestCase {
         ExecutorBuilder<?> executorBuilder = SearchRelevanceExecutor.getExecutorBuilder(settings);
 
         assertNotNull(executorBuilder);
-        assertTrue(executorBuilder instanceof FixedExecutorBuilder);
+        assertTrue(executorBuilder instanceof ScalingExecutorBuilder);
     }
 
     public void testInitializeThrowsExceptionForNullThreadPool() {
