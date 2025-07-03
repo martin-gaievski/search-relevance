@@ -57,7 +57,8 @@ public class ExperimentTaskContextTests extends OpenSearchTestCase {
             configMap,
             resultFuture,
             hasFailure,
-            experimentVariantDao
+            experimentVariantDao,
+            ExperimentType.HYBRID_OPTIMIZER
         );
 
         // Assert
@@ -304,7 +305,8 @@ public class ExperimentTaskContextTests extends OpenSearchTestCase {
             new ConcurrentHashMap<>(),
             new CompletableFuture<>(),
             new AtomicBoolean(false),
-            experimentVariantDao
+            experimentVariantDao,
+            ExperimentType.HYBRID_OPTIMIZER
         );
     }
 

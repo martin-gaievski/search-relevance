@@ -12,14 +12,14 @@ import java.util.Map;
 
 import org.opensearch.searchrelevance.model.ExperimentVariant;
 
-import lombok.Builder;
 import lombok.Getter;
+import lombok.experimental.SuperBuilder;
 
 /**
  * Parameters for scheduling a variant task
  */
 @Getter
-@Builder
+@SuperBuilder
 public class VariantTaskParameters {
     private final String experimentId;
     private final String searchConfigId;

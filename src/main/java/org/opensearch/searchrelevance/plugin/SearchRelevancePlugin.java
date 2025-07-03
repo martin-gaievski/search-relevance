@@ -49,7 +49,7 @@ import org.opensearch.searchrelevance.dao.JudgmentCacheDao;
 import org.opensearch.searchrelevance.dao.JudgmentDao;
 import org.opensearch.searchrelevance.dao.QuerySetDao;
 import org.opensearch.searchrelevance.dao.SearchConfigurationDao;
-import org.opensearch.searchrelevance.executors.HybridSearchTaskManager;
+import org.opensearch.searchrelevance.executors.ExperimentTaskManager;
 import org.opensearch.searchrelevance.executors.SearchRelevanceExecutor;
 import org.opensearch.searchrelevance.indices.SearchRelevanceIndicesManager;
 import org.opensearch.searchrelevance.metrics.MetricsHelper;
@@ -161,7 +161,7 @@ public class SearchRelevancePlugin extends Plugin implements ActionPlugin, Syste
         MachineLearningNodeClient mlClient = new MachineLearningNodeClient(client);
         this.mlAccessor = new MLAccessor(mlClient);
         SearchRelevanceExecutor.initialize(threadPool);
-        HybridSearchTaskManager hybridSearchTaskManager = new HybridSearchTaskManager(
+        ExperimentTaskManager experimentTaskManager = new ExperimentTaskManager(
             client,
             evaluationResultDao,
             experimentVariantDao,
@@ -185,7 +185,7 @@ public class SearchRelevancePlugin extends Plugin implements ActionPlugin, Syste
             mlAccessor,
             metricsHelper,
             infoStatsManager,
-            hybridSearchTaskManager
+            experimentTaskManager
         );
     }
 
