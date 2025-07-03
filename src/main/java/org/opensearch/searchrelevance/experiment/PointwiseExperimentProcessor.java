@@ -31,8 +31,7 @@ import lombok.AllArgsConstructor;
 import lombok.extern.log4j.Log4j2;
 
 /**
- * Processor for running POINTWISE_EVALUATION experiments and collect results
- *
+ * Processor for handling POINTWISE_EVALUATION experiments with task scheduling
  */
 @Log4j2
 @AllArgsConstructor
