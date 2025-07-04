@@ -1,0 +1,91 @@
+name: Tests with LLM Support
+
+on:
+  push:
+    branches: [ main, feature/* ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test-with-localai:
+    runs-on: ubuntu-latest
+    
+    services:
+      localai:
+        image: quay.io/go-skynet/local-ai:v2.23.0
+        ports:
+          - 8080:8080
+        env:
+          MODELS_PATH: /models
+          THREADS: 4
+          CONTEXT_SIZE: 2048
+          DEBUG: "true"
+        options: >-
+          --health-cmd="curl -f http://localhost:8080/readyz || exit 1"
+          --health-interval=30s
+          --health-timeout=10s
+          --health-retries=5
+          
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+    
+    - name: Setup Gradle
+      uses: gradle/gradle-build-action@v2
+      
+    - name: Download and configure LLM model
+      run: |
+        # Create model configuration for LocalAI
+        mkdir -p models
+        
+        # Download a small GGUF model (phi-2)
+        curl -L "https://huggingface.co/TheBloke/phi-2-GGUF/resolve/main/phi-2.Q4_K_M.gguf" \
+          -o models/phi-2.gguf
+        
+        # Create model configuration
+        cat > models/phi-2.yaml <<EOF
+        name: phi-2
+        backend: llama-cpp
+        parameters:
+          model: phi-2.gguf
+          temperature: 0.1
+          top_k: 40
+          top_p: 0.95
+          seed: -1
+          mmap: true
+          f16: true
+          threads: 4
+          batch: 512
+          context_size: 2048
+        template:
+          chat_message: |
+            <|im_start|>{role}
+            {content}<|im_end|>
+          chat: |
+            {messages}
+            <|im_start|>assistant
+          completion: |
+            {prompt}
+        EOF
+        
+        # Copy model to LocalAI container
+        docker cp models/phi-2.gguf $(docker ps -q -f "ancestor=quay.io/go-skynet/local-ai:v2.23.0"):/models/
+        docker cp models/phi-2.yaml $(docker ps -q -f "ancestor=quay.io/go-skynet/local-ai:v2.23.0"):/models/
+        
+        # Wait for model to be loaded
+        sleep 10
+        
+        # Test LocalAI API
+        curl -f http://localhost:8080/v1/models || exit 1
+    
+    - name: Run integration tests with LLM
+      env:
+        LOCALAI_API_URL: http://localhost:8080
+        LLM_MODEL_NAME: phi-2
+      run: |
+        ./gradlew integTest --tests "*LLMJudgmentIT" -Dtests.cluster.llm.enabled=true
