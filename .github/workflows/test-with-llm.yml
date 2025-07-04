@@ -7,85 +7,167 @@ on:
     branches: [ main ]
 
 jobs:
-  test-with-localai:
+  test-with-mock-llm:
     runs-on: ubuntu-latest
-    
-    services:
-      localai:
-        image: quay.io/go-skynet/local-ai:v2.23.0
-        ports:
-          - 8080:8080
-        env:
-          MODELS_PATH: /models
-          THREADS: 4
-          CONTEXT_SIZE: 2048
-          DEBUG: "true"
-        options: >-
-          --health-cmd="curl -f http://localhost:8080/readyz || exit 1"
-          --health-interval=30s
-          --health-timeout=10s
-          --health-retries=5
-          
+
     steps:
     - uses: actions/checkout@v4
-    
-    - name: Set up JDK 17
+
+    - name: Set up JDK 21
       uses: actions/setup-java@v4
       with:
-        java-version: '17'
+        java-version: '21'
         distribution: 'temurin'
-    
+
     - name: Setup Gradle
       uses: gradle/gradle-build-action@v2
-      
-    - name: Download and configure LLM model
+
+    - name: Create Mock LLM Server
       run: |
-        # Create model configuration for LocalAI
-        mkdir -p models
-        
-        # Download a small GGUF model (phi-2)
-        curl -L "https://huggingface.co/TheBloke/phi-2-GGUF/resolve/main/phi-2.Q4_K_M.gguf" \
-          -o models/phi-2.gguf
-        
-        # Create model configuration
-        cat > models/phi-2.yaml <<EOF
-        name: phi-2
-        backend: llama-cpp
-        parameters:
-          model: phi-2.gguf
-          temperature: 0.1
-          top_k: 40
-          top_p: 0.95
-          seed: -1
-          mmap: true
-          f16: true
-          threads: 4
-          batch: 512
-          context_size: 2048
-        template:
-          chat_message: |
-            <|im_start|>{role}
-            {content}<|im_end|>
-          chat: |
-            {messages}
-            <|im_start|>assistant
-          completion: |
-            {prompt}
+        # Create a simple mock LLM server using Python
+        cat > mock_llm_server.py <<'EOF'
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+        import json
+        import uuid
+        from datetime import datetime
+
+        class MockLLMHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == '/v1/models':
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    response = {
+                        "data": [
+                            {
+                                "id": "mock-model",
+                                "object": "model",
+                                "created": int(datetime.now().timestamp()),
+                                "owned_by": "mock"
+                            }
+                        ]
+                    }
+                    self.wfile.write(json.dumps(response).encode())
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def do_POST(self):
+                content_length = int(self.headers['Content-Length'])
+                post_data = self.rfile.read(content_length)
+
+                if self.path == '/v1/chat/completions':
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+
+                    # Mock response for relevance evaluation
+                    response = {
+                        "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+                        "object": "chat.completion",
+                        "created": int(datetime.now().timestamp()),
+                        "model": "mock-model",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "Based on the query and document, I would rate the relevance as 0.85 out of 1.0. The document directly addresses the query about smartphones with good cameras."
+                                },
+                                "finish_reason": "stop"
+                            }
+                        ],
+                        "usage": {
+                            "prompt_tokens": 10,
+                            "completion_tokens": 20,
+                            "total_tokens": 30
+                        }
+                    }
+                    self.wfile.write(json.dumps(response).encode())
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def log_message(self, format, *args):
+                # Suppress log messages
+                pass
+
+        if __name__ == '__main__':
+            server = HTTPServer(('localhost', 8080), MockLLMHandler)
+            print("Mock LLM server started on http://localhost:8080")
+            server.serve_forever()
         EOF
-        
-        # Copy model to LocalAI container
-        docker cp models/phi-2.gguf $(docker ps -q -f "ancestor=quay.io/go-skynet/local-ai:v2.23.0"):/models/
-        docker cp models/phi-2.yaml $(docker ps -q -f "ancestor=quay.io/go-skynet/local-ai:v2.23.0"):/models/
-        
-        # Wait for model to be loaded
-        sleep 10
-        
-        # Test LocalAI API
-        curl -f http://localhost:8080/v1/models || exit 1
-    
-    - name: Run integration tests with LLM
+
+        # Start the mock server in the background
+        python3 mock_llm_server.py &
+        MOCK_SERVER_PID=$!
+        echo "MOCK_SERVER_PID=$MOCK_SERVER_PID" >> $GITHUB_ENV
+
+        # Wait for server to start
+        sleep 2
+
+        # Test the mock server
+        curl -s http://localhost:8080/v1/models | jq .
+
+    - name: Run integration tests with Mock LLM
       env:
         LOCALAI_API_URL: http://localhost:8080
-        LLM_MODEL_NAME: phi-2
+        LLM_MODEL_NAME: mock-model
       run: |
-        ./gradlew integTest --tests "*LLMJudgmentIT" -Dtests.cluster.llm.enabled=true
+        ./gradlew integTest --tests "*LLMJudgmentGenerationIT" -Dtests.cluster.llm.enabled=true
+
+    - name: Stop Mock Server
+      if: always()
+      run: |
+        if [ ! -z "$MOCK_SERVER_PID" ]; then
+          kill $MOCK_SERVER_PID || true
+        fi
+
+  # Alternative job using llamafile (single binary, ~4GB but faster than LocalAI)
+  test-with-llamafile:
+    runs-on: ubuntu-latest
+    # if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up JDK 21
+      uses: actions/setup-java@v4
+      with:
+        java-version: '21'
+        distribution: 'temurin'
+
+    - name: Setup Llamafile
+      run: |
+        # Download TinyLlama llamafile (smallest available, ~600MB)
+        wget -q https://huggingface.co/jartine/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/TinyLlama-1.1B-Chat-v1.0.Q4_K_M.llamafile
+        chmod +x TinyLlama-1.1B-Chat-v1.0.Q4_K_M.llamafile
+
+        # Start llamafile server
+        ./TinyLlama-1.1B-Chat-v1.0.Q4_K_M.llamafile --server --port 8080 --nobrowser &
+        LLAMAFILE_PID=$!
+        echo "LLAMAFILE_PID=$LLAMAFILE_PID" >> $GITHUB_ENV
+
+        # Wait for server to start (may take a minute)
+        echo "Waiting for llamafile to start..."
+        for i in {1..60}; do
+          if curl -s http://localhost:8080/v1/models > /dev/null; then
+            echo "Llamafile started successfully"
+            break
+          fi
+          sleep 2
+        done
+
+    - name: Run integration tests with Llamafile
+      env:
+        LOCALAI_API_URL: http://localhost:8080
+        LLM_MODEL_NAME: TinyLlama-1.1B-Chat-v1.0
+      run: |
+        ./gradlew integTest --tests "*LLMJudgmentGenerationIT" -Dtests.cluster.llm.enabled=true
+
+    - name: Stop Llamafile
+      if: always()
+      run: |
+        if [ ! -z "$LLAMAFILE_PID" ]; then
+          kill $LLAMAFILE_PID || true
+        fi

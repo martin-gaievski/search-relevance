@@ -5,9 +5,16 @@
  * this file be licensed under the Apache-2.0 license or a
  * compatible open source license.
  */
-package org.opensearch.searchrelevance.ml;
+package org.opensearch.searchrelevance.action.judgment;
+
+import static org.opensearch.searchrelevance.common.PluginConstants.JUDGMENTS_URL;
+import static org.opensearch.searchrelevance.common.PluginConstants.JUDGMENT_INDEX;
+import static org.opensearch.searchrelevance.common.PluginConstants.QUERYSETS_URL;
 
 import java.io.IOException;
+import java.net.URISyntaxException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 
@@ -16,7 +23,7 @@ import org.apache.hc.core5.http.message.BasicHeader;
 import org.junit.Before;
 import org.opensearch.client.Response;
 import org.opensearch.rest.RestRequest;
-import org.opensearch.searchrelevance.BaseSearchRelevanceIT;
+import org.opensearch.searchrelevance.experiment.BaseExperimentIT;
 import org.opensearch.test.OpenSearchIntegTestCase;
 
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
@@ -25,20 +32,17 @@ import com.google.common.collect.ImmutableList;
 import lombok.SneakyThrows;
 
 /**
- * Integration tests for LLM judgment functionality with ML Commons.
- * This test demonstrates setting up ML Commons with a remote LLM connector,
- * registering and deploying a model, and making prediction calls.
+ * Integration tests for LLM-based judgment creation functionality.
  */
 @ThreadLeakScope(ThreadLeakScope.Scope.NONE)
 @OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.SUITE)
-public class LLMJudgmentIT extends BaseSearchRelevanceIT {
+public class LLMJudgmentGenerationIT extends BaseExperimentIT {
 
     private static final String ML_COMMONS_CONNECTORS_URL = "/_plugins/_ml/connectors/_create";
     private static final String ML_COMMONS_MODELS_REGISTER_URL = "/_plugins/_ml/models/_register";
     private static final String ML_COMMONS_MODELS_DEPLOY_URL = "/_plugins/_ml/models/%s/_deploy";
     private static final String ML_COMMONS_TASKS_URL = "/_plugins/_ml/tasks/%s";
     private static final String ML_COMMONS_MODELS_URL = "/_plugins/_ml/models/%s";
-    private static final String ML_COMMONS_PREDICT_URL = "/_plugins/_ml/_predict/%s/%s";
     private static final String CLUSTER_SETTINGS_URL = "/_cluster/settings";
 
     private static final int MAX_WAIT_TIME_MS = 60000;
@@ -49,56 +53,233 @@ public class LLMJudgmentIT extends BaseSearchRelevanceIT {
 
     @Before
     @SneakyThrows
-    public void setupMLCommons() {
-        // Only configure ML Commons if LLM testing is enabled
+    public void setupMLCommonsAndLLM() {
         if (!isLLMTestingEnabled()) {
             return;
         }
 
         configureMLCommonsSettings();
-        Thread.sleep(DEFAULT_INTERVAL_MS);
+
+        connectorId = createRemoteConnector();
+        assertNotNull("Connector ID should not be null", connectorId);
+
+        String registerTaskId = registerModel(connectorId);
+        assertNotNull("Register task ID should not be null", registerTaskId);
+
+        modelId = waitForTaskCompletionAndGetModelId(registerTaskId);
+        assertNotNull("Model ID should not be null", modelId);
+
+        String deployTaskId = deployModel(modelId);
+        assertNotNull("Deploy task ID should not be null", deployTaskId);
+
+        waitForTaskCompletion(deployTaskId);
+        waitForModelDeployment(modelId);
     }
 
     @SneakyThrows
-    public void testMLCommonsLLMIntegration() {
-        // Skip test if LLM testing is not enabled
+    public void testLLMJudgmentCreation() {
         if (!isLLMTestingEnabled()) {
-            logger.info("Skipping LLM test - LLM testing not enabled");
             return;
         }
 
+        createSampleDocumentsIndex();
+
+        String judgmentsId = createLLMJudgments();
+        assertNotNull("Judgments ID should not be null", judgmentsId);
+
+        Map<String, Object> judgmentSource = pollJudgmentUntilCompleted(judgmentsId);
+
+        verifyLLMJudgments(judgmentSource);
+
+        deleteLLMJudgments(judgmentsId);
+    }
+
+    private void createSampleDocumentsIndex() throws IOException {
         try {
-            // Step 1: Create remote connector
-            connectorId = createRemoteConnector();
-            assertNotNull("Connector ID should not be null", connectorId);
-            logger.info("Created connector with ID: " + connectorId);
+            String indexName = "test-products";
 
-            // Step 2: Register model
-            String registerTaskId = registerModel(connectorId);
-            assertNotNull("Register task ID should not be null", registerTaskId);
+            String createIndexBody = Files.readString(Path.of(classLoader.getResource("data/test-products-mapping.json").toURI()));
 
-            // Step 3: Wait for registration to complete and get model ID
-            modelId = waitForTaskCompletionAndGetModelId(registerTaskId);
-            assertNotNull("Model ID should not be null", modelId);
-            logger.info("Registered model with ID: " + modelId);
+            makeRequest(
+                adminClient(),
+                RestRequest.Method.PUT.name(),
+                indexName,
+                null,
+                toHttpEntity(createIndexBody),
+                ImmutableList.of(new BasicHeader(HttpHeaders.USER_AGENT, DEFAULT_USER_AGENT))
+            );
 
-            // Step 4: Deploy model
-            String deployTaskId = deployModel(modelId);
-            assertNotNull("Deploy task ID should not be null", deployTaskId);
+            String importDatasetBody = Files.readString(Path.of(classLoader.getResource("data/test-products-documents.json").toURI()));
+            importDatasetBody = importDatasetBody.replace("{{index_name}}", indexName);
+            bulkIngest(indexName, importDatasetBody);
 
-            // Step 5: Wait for deployment to complete
-            waitForTaskCompletion(deployTaskId);
-            waitForModelDeployment(modelId);
-            logger.info("Model deployed successfully");
-
-            // Step 6: Test prediction
-            testModelPrediction(modelId);
-            logger.info("Model prediction test successful");
-
-        } catch (Exception e) {
-            logger.error("Test failed with exception: ", e);
-            throw e;
+        } catch (URISyntaxException e) {
+            throw new IOException("Failed to load test data resource files", e);
         }
+    }
+
+    private String createLLMJudgments() throws IOException {
+        String querySetId = createQuerySet();
+        String searchConfigId = createSearchConfiguration("test-products");
+
+        String llmJudgmentBody = "{\n"
+            + "  \"name\": \"LLM Generated Judgments\",\n"
+            + "  \"type\": \"LLM_JUDGMENT\",\n"
+            + "  \"querySetId\": \""
+            + querySetId
+            + "\",\n"
+            + "  \"searchConfigurationList\": [\""
+            + searchConfigId
+            + "\"],\n"
+            + "  \"size\": 5,\n"
+            + "  \"modelId\": \""
+            + modelId
+            + "\",\n"
+            + "  \"contextFields\": []\n"
+            + "}";
+
+        Response response = makeRequest(
+            client(),
+            RestRequest.Method.PUT.name(),
+            JUDGMENTS_URL,
+            null,
+            toHttpEntity(llmJudgmentBody),
+            ImmutableList.of(new BasicHeader(HttpHeaders.USER_AGENT, DEFAULT_USER_AGENT))
+        );
+
+        Map<String, Object> responseMap = entityAsMap(response);
+        assertNotNull("LLM judgment response should not be null", responseMap);
+
+        String judgmentId = (String) responseMap.get("judgment_id");
+        return judgmentId;
+    }
+
+    protected String createQuerySet() throws IOException {
+        try {
+            String querySetBody = Files.readString(Path.of(classLoader.getResource("queryset/CreateQuerySet.json").toURI()));
+
+            Response response = makeRequest(
+                client(),
+                RestRequest.Method.PUT.name(),
+                QUERYSETS_URL,
+                null,
+                toHttpEntity(querySetBody),
+                ImmutableList.of(new BasicHeader(HttpHeaders.USER_AGENT, DEFAULT_USER_AGENT))
+            );
+
+            Map<String, Object> responseMap = entityAsMap(response);
+            assertNotNull("QuerySet creation response should not be null", responseMap);
+
+            String querySetId = (String) responseMap.get("query_set_id");
+            return querySetId;
+        } catch (URISyntaxException e) {
+            throw new IOException("Failed to load QuerySet resource file", e);
+        }
+    }
+
+    private Map<String, Object> pollJudgmentUntilCompleted(String judgmentId) throws IOException {
+        Map<String, Object> source = null;
+        String getJudgmentByIdUrl = String.join("/", JUDGMENT_INDEX, "_doc", judgmentId);
+
+        int retryCount = 0;
+        String status = "PROCESSING";
+
+        while (("PROCESSING".equals(status) || status == null) && retryCount < MAX_POLL_RETRIES) {
+            Response getJudgmentResponse = makeRequest(
+                adminClient(),
+                RestRequest.Method.GET.name(),
+                getJudgmentByIdUrl,
+                null,
+                null,
+                ImmutableList.of(new BasicHeader(HttpHeaders.USER_AGENT, DEFAULT_USER_AGENT))
+            );
+            Map<String, Object> getJudgmentResultJson = entityAsMap(getJudgmentResponse);
+            assertNotNull(getJudgmentResultJson);
+            assertEquals(judgmentId, getJudgmentResultJson.get("_id").toString());
+
+            source = (Map<String, Object>) getJudgmentResultJson.get("_source");
+            assertNotNull(source);
+            status = (String) source.get("status");
+
+            if ("PROCESSING".equals(status) || status == null) {
+                retryCount++;
+                try {
+                    Thread.sleep(DEFAULT_INTERVAL_MS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        if (retryCount >= MAX_POLL_RETRIES && ("PROCESSING".equals(status) || status == null)) {
+            fail("Judgment did not complete within timeout period. Final status: " + status);
+        }
+
+        return source;
+    }
+
+    private void verifyLLMJudgments(Map<String, Object> source) throws IOException {
+        assertNotNull("Judgment source should not be null", source);
+        assertNotNull("Judgment should have ID", source.get("id"));
+        assertNotNull("Judgment should have timestamp", source.get("timestamp"));
+        assertEquals("LLM Generated Judgments", source.get("name"));
+
+        String status = (String) source.get("status");
+        if ("ERROR".equals(status)) {
+            fail("LLM judgment failed with ERROR status");
+        }
+
+        assertEquals("COMPLETED", status);
+
+        List<Map<String, Object>> judgmentRatings = (List<Map<String, Object>>) source.get("judgmentRatings");
+        assertNotNull("Judgment ratings should not be null", judgmentRatings);
+        assertFalse("Judgment ratings list should not be empty", judgmentRatings.isEmpty());
+
+        boolean foundRatingGreaterThanZero = false;
+
+        for (Map<String, Object> judgment : judgmentRatings) {
+            String query = (String) judgment.get("query");
+            assertNotNull("Query should not be null", query);
+
+            List<Map<String, Object>> ratings = (List<Map<String, Object>>) judgment.get("ratings");
+            assertNotNull("Ratings should not be null", ratings);
+
+            if (!ratings.isEmpty()) {
+                for (Map<String, Object> rating : ratings) {
+                    assertNotNull("Doc ID should not be null", rating.get("docId"));
+                    assertNotNull("Rating should not be null", rating.get("rating"));
+
+                    String ratingStr = rating.get("rating").toString();
+                    double ratingValue = Double.parseDouble(ratingStr);
+                    assertTrue("Rating should be between 0.0 and 1.0", ratingValue >= 0.0 && ratingValue <= 1.0);
+
+                    if (ratingValue > 0.0) {
+                        foundRatingGreaterThanZero = true;
+                    }
+                }
+            }
+        }
+
+        assertTrue("At least one rating should be greater than 0.0", foundRatingGreaterThanZero);
+    }
+
+    private void deleteLLMJudgments(String judgmentsId) throws IOException {
+        String deleteJudgmentUrl = String.join("/", JUDGMENT_INDEX, "_doc", judgmentsId);
+        Response deleteResponse = makeRequest(
+            client(),
+            RestRequest.Method.DELETE.name(),
+            deleteJudgmentUrl,
+            null,
+            null,
+            ImmutableList.of(new BasicHeader(HttpHeaders.USER_AGENT, DEFAULT_USER_AGENT))
+        );
+
+        Map<String, Object> deleteResultJson = entityAsMap(deleteResponse);
+        assertNotNull("Delete response should not be null", deleteResultJson);
+        assertEquals("Judgment should be deleted", "deleted", deleteResultJson.get("result").toString());
     }
 
     private void configureMLCommonsSettings() throws IOException {
@@ -112,26 +293,16 @@ public class LLMJudgmentIT extends BaseSearchRelevanceIT {
             + "    \"plugins.ml_commons.allow_registering_model_via_url\": true,\n"
             + "    \"plugins.ml_commons.allow_registering_model_via_local_file\": true,\n"
             + "    \"plugins.ml_commons.trusted_connector_endpoints_regex\": [\n"
-            + "      \"^https://runtime\\\\.sagemaker\\\\..*\\\\.amazonaws\\\\.com/.*\",\n"
-            + "      \"^https://api\\\\.openai\\\\.com/.*\",\n"
-            + "      \"^https://api\\\\.cohere\\\\.ai/.*\",\n"
-            + "      \"^https://.*\\\\.openai\\\\.azure\\\\.com/.*\",\n"
-            + "      \"^https://api\\\\.anthropic\\\\.com/.*\",\n"
-            + "      \"^https://bedrock-runtime\\\\..*\\\\.amazonaws\\\\.com/.*\",\n"
             + "      \"^http://localhost:.*\",\n"
             + "      \"^https://localhost:.*\",\n"
             + "      \"^http://127\\\\.0\\\\.0\\\\.1:.*\",\n"
-            + "      \"^https://127\\\\.0\\\\.0\\\\.1:.*\",\n"
-            + "      \"^http://host\\\\.docker\\\\.internal:.*\",\n"
-            + "      \"^https://host\\\\.docker\\\\.internal:.*\"\n"
+            + "      \"^https://127\\\\.0\\\\.0\\\\.1:.*\"\n"
             + "    ],\n"
             + "    \"plugins.ml_commons.trusted_url_regex\": [\n"
             + "      \"^http://localhost:.*\",\n"
             + "      \"^https://localhost:.*\",\n"
             + "      \"^http://127\\\\.0\\\\.0\\\\.1:.*\",\n"
-            + "      \"^https://127\\\\.0\\\\.0\\\\.1:.*\",\n"
-            + "      \"^http://host\\\\.docker\\\\.internal:.*\",\n"
-            + "      \"^https://host\\\\.docker\\\\.internal:.*\"\n"
+            + "      \"^https://127\\\\.0\\\\.0\\\\.1:.*\"\n"
             + "    ]\n"
             + "  }\n"
             + "}";
@@ -153,8 +324,8 @@ public class LLMJudgmentIT extends BaseSearchRelevanceIT {
         String modelName = getLLMModelName();
 
         String connectorBody = "{\n"
-            + "  \"name\": \"LLM POC Connector\",\n"
-            + "  \"description\": \"Connector for LLM testing\",\n"
+            + "  \"name\": \"LLM Judgments Connector\",\n"
+            + "  \"description\": \"Connector for LLM-based judgment generation\",\n"
             + "  \"version\": \"1.0.0\",\n"
             + "  \"protocol\": \"http\",\n"
             + "  \"parameters\": {\n"
@@ -184,7 +355,7 @@ public class LLMJudgmentIT extends BaseSearchRelevanceIT {
             + "\\\", "
             + "\\\"messages\\\": ${parameters.messages}, "
             + "\\\"temperature\\\": 0.1, "
-            + "\\\"max_tokens\\\": 1000, "
+            + "\\\"max_tokens\\\": 100, "
             + "\\\"stream\\\": false }\"\n"
             + "    }\n"
             + "  ]\n"
@@ -200,12 +371,13 @@ public class LLMJudgmentIT extends BaseSearchRelevanceIT {
         );
 
         Map<String, Object> responseMap = entityAsMap(response);
-        return (String) responseMap.get("connector_id");
+        String connectorId = (String) responseMap.get("connector_id");
+        return connectorId;
     }
 
     private String registerModel(String connectorId) throws IOException {
         String registerBody = "{\n"
-            + "  \"name\": \"LLM POC Model\",\n"
+            + "  \"name\": \"LLM Judgments Model\",\n"
             + "  \"function_name\": \"remote\",\n"
             + "  \"connector_id\": \""
             + connectorId
@@ -222,7 +394,8 @@ public class LLMJudgmentIT extends BaseSearchRelevanceIT {
         );
 
         Map<String, Object> responseMap = entityAsMap(response);
-        return (String) responseMap.get("task_id");
+        String taskId = (String) responseMap.get("task_id");
+        return taskId;
     }
 
     private String deployModel(String modelId) throws IOException {
@@ -236,90 +409,8 @@ public class LLMJudgmentIT extends BaseSearchRelevanceIT {
         );
 
         Map<String, Object> responseMap = entityAsMap(response);
-        return (String) responseMap.get("task_id");
-    }
-
-    private void testModelPrediction(String modelId) throws IOException {
-        String expectedModelName = getLLMModelName();
-        String apiUrl = getLLMApiUrl();
-
-        logger.warn("=== LLM Model Prediction Test ===");
-        logger.warn("Expected model name: " + expectedModelName);
-        logger.warn("API URL: " + apiUrl);
-        logger.warn("Model ID: " + modelId);
-
-        String predictBody = "{\n"
-            + "  \"parameters\": {\n"
-            + "    \"messages\": [\n"
-            + "      {\n"
-            + "        \"role\": \"system\",\n"
-            + "        \"content\": \"You are a helpful assistant that evaluates search relevance.\"\n"
-            + "      },\n"
-            + "      {\n"
-            + "        \"role\": \"user\",\n"
-            + "        \"content\": \"Rate the relevance of 'iPhone 15 Pro' to the query 'smartphone with good camera' on a scale of 0 to 1.\"\n"
-            + "      }\n"
-            + "    ]\n"
-            + "  }\n"
-            + "}";
-
-        logger.warn("Sending prediction request to model...");
-        logger.warn("Request body: " + predictBody);
-
-        Response response = makeRequest(
-            client(),
-            RestRequest.Method.POST.name(),
-            String.format(ML_COMMONS_PREDICT_URL, "remote", modelId),
-            null,
-            toHttpEntity(predictBody),
-            ImmutableList.of(new BasicHeader(HttpHeaders.USER_AGENT, DEFAULT_USER_AGENT))
-        );
-
-        logger.warn("Received response with status: " + response.getStatusLine().getStatusCode());
-
-        Map<String, Object> responseMap = entityAsMap(response);
-        assertNotNull("Prediction response should not be null", responseMap);
-
-        logger.warn("=== Full LLM Response ===");
-        logger.warn("Response: " + responseMap);
-
-        // Verify the response structure
-        assertTrue("Response should contain inference_results", responseMap.containsKey("inference_results"));
-        List<Map<String, Object>> inferenceResults = (List<Map<String, Object>>) responseMap.get("inference_results");
-        assertNotNull("Inference results should not be null", inferenceResults);
-        assertFalse("Inference results should not be empty", inferenceResults.isEmpty());
-
-        Map<String, Object> firstResult = inferenceResults.get(0);
-        assertNotNull("First inference result should not be null", firstResult);
-        assertTrue("Result should contain output", firstResult.containsKey("output"));
-
-        List<Map<String, Object>> outputs = (List<Map<String, Object>>) firstResult.get("output");
-        assertNotNull("Outputs should not be null", outputs);
-        assertFalse("Outputs should not be empty", outputs.isEmpty());
-
-        // Log the actual model output for debugging
-        Map<String, Object> firstOutput = outputs.get(0);
-        if (firstOutput.containsKey("dataAsMap")) {
-            Map<String, Object> dataAsMap = (Map<String, Object>) firstOutput.get("dataAsMap");
-            logger.warn("=== Model Output Details ===");
-            logger.warn("DataAsMap: " + dataAsMap);
-
-            if (dataAsMap.containsKey("choices")) {
-                List<Map<String, Object>> choices = (List<Map<String, Object>>) dataAsMap.get("choices");
-                if (!choices.isEmpty()) {
-                    Map<String, Object> firstChoice = choices.get(0);
-                    if (firstChoice.containsKey("message")) {
-                        Map<String, Object> message = (Map<String, Object>) firstChoice.get("message");
-                        String content = (String) message.get("content");
-                        logger.warn("LLM Response Content: " + content);
-                    }
-                }
-            }
-        }
-
-        logger.warn("=== Model Connectivity Test PASSED ===");
-        logger.warn("Successfully connected to LLM model: " + expectedModelName);
-        logger.warn("Model is reachable and responding to prediction requests");
+        String taskId = (String) responseMap.get("task_id");
+        return taskId;
     }
 
     private String waitForTaskCompletionAndGetModelId(String taskId) throws IOException, InterruptedException {
@@ -415,13 +506,11 @@ public class LLMJudgmentIT extends BaseSearchRelevanceIT {
     }
 
     private boolean isLLMTestingEnabled() {
-        // Check if LLM testing is enabled via system property
         String llmEnabled = System.getProperty("tests.cluster.llm.enabled", "false");
         return "true".equalsIgnoreCase(llmEnabled);
     }
 
     private String getLLMApiUrl() {
-        // Get LLM API URL from environment or use default
         String apiUrl = System.getenv("LOCALAI_API_URL");
         if (apiUrl == null || apiUrl.isEmpty()) {
             apiUrl = System.getProperty("tests.cluster.llm.api.url", "http://localhost:8080");
@@ -430,7 +519,6 @@ public class LLMJudgmentIT extends BaseSearchRelevanceIT {
     }
 
     private String getLLMModelName() {
-        // Get LLM model name from environment or use default
         String modelName = System.getenv("LLM_MODEL_NAME");
         if (modelName == null || modelName.isEmpty()) {
             modelName = System.getProperty("tests.cluster.llm.model.name", "phi-2");
