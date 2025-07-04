@@ -230,6 +230,14 @@ public class LLMJudgmentIT extends BaseSearchRelevanceIT {
     }
 
     private void testModelPrediction(String modelId) throws IOException {
+        String expectedModelName = getLLMModelName();
+        String apiUrl = getLLMApiUrl();
+        
+        logger.info("=== LLM Model Prediction Test ===");
+        logger.info("Expected model name: " + expectedModelName);
+        logger.info("API URL: " + apiUrl);
+        logger.info("Model ID: " + modelId);
+        
         String predictBody = "{\n"
             + "  \"parameters\": {\n"
             + "    \"messages\": [\n"
@@ -245,6 +253,9 @@ public class LLMJudgmentIT extends BaseSearchRelevanceIT {
             + "  }\n"
             + "}";
 
+        logger.info("Sending prediction request to model...");
+        logger.info("Request body: " + predictBody);
+
         Response response = makeRequest(
             client(),
             RestRequest.Method.POST.name(),
@@ -254,8 +265,13 @@ public class LLMJudgmentIT extends BaseSearchRelevanceIT {
             ImmutableList.of(new BasicHeader(HttpHeaders.USER_AGENT, DEFAULT_USER_AGENT))
         );
 
+        logger.info("Received response with status: " + response.getStatusLine().getStatusCode());
+
         Map<String, Object> responseMap = entityAsMap(response);
         assertNotNull("Prediction response should not be null", responseMap);
+
+        logger.info("=== Full LLM Response ===");
+        logger.info("Response: " + responseMap);
 
         // Verify the response structure
         assertTrue("Response should contain inference_results", responseMap.containsKey("inference_results"));
@@ -271,7 +287,29 @@ public class LLMJudgmentIT extends BaseSearchRelevanceIT {
         assertNotNull("Outputs should not be null", outputs);
         assertFalse("Outputs should not be empty", outputs.isEmpty());
 
-        logger.info("Prediction response: " + responseMap);
+        // Log the actual model output for debugging
+        Map<String, Object> firstOutput = outputs.get(0);
+        if (firstOutput.containsKey("dataAsMap")) {
+            Map<String, Object> dataAsMap = (Map<String, Object>) firstOutput.get("dataAsMap");
+            logger.info("=== Model Output Details ===");
+            logger.info("DataAsMap: " + dataAsMap);
+            
+            if (dataAsMap.containsKey("choices")) {
+                List<Map<String, Object>> choices = (List<Map<String, Object>>) dataAsMap.get("choices");
+                if (!choices.isEmpty()) {
+                    Map<String, Object> firstChoice = choices.get(0);
+                    if (firstChoice.containsKey("message")) {
+                        Map<String, Object> message = (Map<String, Object>) firstChoice.get("message");
+                        String content = (String) message.get("content");
+                        logger.info("LLM Response Content: " + content);
+                    }
+                }
+            }
+        }
+
+        logger.info("=== Model Connectivity Test PASSED ===");
+        logger.info("Successfully connected to LLM model: " + expectedModelName);
+        logger.info("Model is reachable and responding to prediction requests");
     }
 
     private String waitForTaskCompletionAndGetModelId(String taskId) throws IOException, InterruptedException {
