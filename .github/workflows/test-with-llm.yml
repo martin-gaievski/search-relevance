@@ -7,187 +7,6 @@ on:
     branches: [ main ]
 
 jobs:
-  test-with-mock-llm:
-    runs-on: ubuntu-latest
-
-    steps:
-    - uses: actions/checkout@v4
-
-    - name: Set up JDK 21
-      uses: actions/setup-java@v4
-      with:
-        java-version: '21'
-        distribution: 'temurin'
-
-    - name: Setup Gradle
-      uses: gradle/gradle-build-action@v2
-
-    - name: Create Mock LLM Server
-      run: |
-        # Create a simple mock LLM server using Python
-        cat > mock_llm_server.py <<'EOF'
-        from http.server import HTTPServer, BaseHTTPRequestHandler
-        import json
-        import uuid
-        from datetime import datetime
-
-        class MockLLMHandler(BaseHTTPRequestHandler):
-            def do_GET(self):
-                if self.path == '/v1/models':
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'application/json')
-                    self.end_headers()
-                    response = {
-                        "data": [
-                            {
-                                "id": "mock-model",
-                                "object": "model",
-                                "created": int(datetime.now().timestamp()),
-                                "owned_by": "mock"
-                            }
-                        ]
-                    }
-                    self.wfile.write(json.dumps(response).encode())
-                else:
-                    self.send_response(404)
-                    self.end_headers()
-
-            def do_POST(self):
-                content_length = int(self.headers['Content-Length'])
-                post_data = self.rfile.read(content_length)
-
-                if self.path == '/v1/chat/completions':
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'application/json')
-                    self.end_headers()
-
-                    # Mock response for relevance evaluation
-                    response = {
-                        "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
-                        "object": "chat.completion",
-                        "created": int(datetime.now().timestamp()),
-                        "model": "mock-model",
-                        "choices": [
-                            {
-                                "index": 0,
-                                "message": {
-                                    "role": "assistant",
-                                    "content": "Based on the query and document, I would rate the relevance as 0.85 out of 1.0. The document directly addresses the query about smartphones with good cameras."
-                                },
-                                "finish_reason": "stop"
-                            }
-                        ],
-                        "usage": {
-                            "prompt_tokens": 10,
-                            "completion_tokens": 20,
-                            "total_tokens": 30
-                        }
-                    }
-                    self.wfile.write(json.dumps(response).encode())
-                else:
-                    self.send_response(404)
-                    self.end_headers()
-
-            def log_message(self, format, *args):
-                # Suppress log messages
-                pass
-
-        if __name__ == '__main__':
-            server = HTTPServer(('localhost', 8080), MockLLMHandler)
-            print("Mock LLM server started on http://localhost:8080")
-            server.serve_forever()
-        EOF
-
-        # Start the mock server in the background
-        python3 mock_llm_server.py &
-        MOCK_SERVER_PID=$!
-        echo "MOCK_SERVER_PID=$MOCK_SERVER_PID" >> $GITHUB_ENV
-
-        # Wait for server to start
-        sleep 2
-
-        # Test the mock server
-        curl -s http://localhost:8080/v1/models | jq .
-
-    - name: Run integration tests with Mock LLM
-      env:
-        LOCALAI_API_URL: http://localhost:8080
-        LLM_MODEL_NAME: mock-model
-      run: |
-        ./gradlew integTest --tests "*LLMJudgmentGenerationIT" -Dtests.cluster.llm.enabled=true
-
-    - name: Stop Mock Server
-      if: always()
-      run: |
-        if [ ! -z "$MOCK_SERVER_PID" ]; then
-          kill $MOCK_SERVER_PID || true
-        fi
-
-  # Alternative job using llamafile with TinyLlama (lightweight, fast startup)
-  test-with-llamafile:
-    runs-on: ubuntu-latest
-    # if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-
-    steps:
-    - uses: actions/checkout@v4
-
-    - name: Set up JDK 21
-      uses: actions/setup-java@v4
-      with:
-        java-version: '21'
-        distribution: 'temurin'
-
-    - name: Setup Llamafile with TinyLlama
-      run: |
-        # Download TinyLlama llamafile (~600MB, fast startup)
-        echo "Downloading TinyLlama llamafile..."
-        wget -q --show-progress https://huggingface.co/jartine/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/TinyLlama-1.1B-Chat-v1.0.Q4_K_M.llamafile
-        chmod +x TinyLlama-1.1B-Chat-v1.0.Q4_K_M.llamafile
-
-        # Start llamafile server
-        echo "Starting TinyLlama server..."
-        ./TinyLlama-1.1B-Chat-v1.0.Q4_K_M.llamafile --server --port 8080 --nobrowser &
-        LLAMAFILE_PID=$!
-        echo "LLAMAFILE_PID=$LLAMAFILE_PID" >> $GITHUB_ENV
-
-        # Wait for server to start
-        echo "Waiting for TinyLlama to start..."
-        for i in {1..60}; do
-          if curl -s http://localhost:8080/v1/models > /dev/null; then
-            echo "TinyLlama started successfully"
-            # Test that the model responds properly
-            curl -s http://localhost:8080/v1/models | jq .
-            break
-          fi
-          echo "Attempt $i/60: Still waiting..."
-          sleep 2
-        done
-
-        # Verify the model is working
-        echo "Testing TinyLlama API..."
-        curl -X POST http://localhost:8080/v1/chat/completions \
-          -H "Content-Type: application/json" \
-          -d '{
-            "model": "TinyLlama-1.1B-Chat-v1.0",
-            "messages": [{"role": "user", "content": "Hello, are you working?"}],
-            "max_tokens": 50
-          }' | jq .
-
-    - name: Run integration tests with TinyLlama
-      env:
-        LOCALAI_API_URL: http://localhost:8080
-        LLM_MODEL_NAME: TinyLlama-1.1B-Chat-v1.0
-      run: |
-        ./gradlew integTest --tests "*LLMJudgmentGenerationIT" -Dtests.cluster.llm.enabled=true
-
-    - name: Stop Llamafile
-      if: always()
-      run: |
-        if [ ! -z "$LLAMAFILE_PID" ]; then
-          echo "Stopping TinyLlama server..."
-          kill $LLAMAFILE_PID || true
-        fi
-
   # Third job using Ollama with a lightweight model
   test-with-ollama:
     runs-on: ubuntu-latest
@@ -207,13 +26,13 @@ jobs:
         # Download and install Ollama
         echo "Installing Ollama..."
         curl -fsSL https://ollama.com/install.sh | sh
-        
+
         # Start Ollama service in background
         echo "Starting Ollama service..."
         ollama serve &
         OLLAMA_PID=$!
         echo "OLLAMA_PID=$OLLAMA_PID" >> $GITHUB_ENV
-        
+
         # Wait for Ollama to be ready
         echo "Waiting for Ollama to start..."
         for i in {1..30}; do
@@ -228,7 +47,7 @@ jobs:
         # Pull a lightweight model (phi3:mini is good balance of size/quality)
         echo "Pulling Phi-3 mini model..."
         ollama pull phi3:mini
-        
+
         # Verify model is available
         echo "Available models:"
         ollama list
@@ -237,10 +56,10 @@ jobs:
       run: |
         # Test Ollama API compatibility
         echo "Testing Ollama API..."
-        
+
         # Test models endpoint
         curl -s http://localhost:11434/api/tags | jq .
-        
+
         # Test chat completion
         curl -s -X POST http://localhost:11434/api/chat \
           -H "Content-Type: application/json" \
@@ -258,36 +77,50 @@ jobs:
         import json
         import requests
         import uuid
+        import traceback
         from datetime import datetime
 
         class OllamaHandler(BaseHTTPRequestHandler):
             def do_GET(self):
-                if self.path == '/v1/models':
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'application/json')
-                    self.end_headers()
-                    response = {
-                        "data": [
-                            {
-                                "id": "phi3:mini",
-                                "object": "model",
-                                "created": int(datetime.now().timestamp()),
-                                "owned_by": "ollama"
-                            }
-                        ]
-                    }
-                    self.wfile.write(json.dumps(response).encode())
-                else:
-                    self.send_response(404)
+                try:
+                    if self.path == '/v1/models':
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'application/json')
+                        self.end_headers()
+                        response = {
+                            "data": [
+                                {
+                                    "id": "phi3:mini",
+                                    "object": "model",
+                                    "created": int(datetime.now().timestamp()),
+                                    "owned_by": "ollama"
+                                }
+                            ]
+                        }
+                        self.wfile.write(json.dumps(response).encode())
+                    else:
+                        self.send_response(404)
+                        self.end_headers()
+                except Exception as e:
+                    print(f"GET Error: {e}")
+                    traceback.print_exc()
+                    self.send_response(500)
                     self.end_headers()
 
             def do_POST(self):
-                content_length = int(self.headers['Content-Length'])
-                post_data = self.rfile.read(content_length)
-                request_data = json.loads(post_data.decode('utf-8'))
+                try:
+                    content_length = int(self.headers.get('Content-Length', 0))
+                    if content_length == 0:
+                        self.send_response(400)
+                        self.end_headers()
+                        return
+                        
+                    post_data = self.rfile.read(content_length)
+                    request_data = json.loads(post_data.decode('utf-8'))
+                    
+                    print(f"Received request: {json.dumps(request_data, indent=2)}")
 
-                if self.path == '/v1/chat/completions':
-                    try:
+                    if self.path == '/v1/chat/completions':
                         # Convert OpenAI format to Ollama format
                         ollama_request = {
                             "model": "phi3:mini",
@@ -295,20 +128,26 @@ jobs:
                             "stream": False
                         }
                         
-                        # Call Ollama API
+                        print(f"Sending to Ollama: {json.dumps(ollama_request, indent=2)}")
+
+                        # Call Ollama API with longer timeout
                         ollama_response = requests.post(
                             "http://localhost:11434/api/chat",
                             json=ollama_request,
-                            timeout=30
+                            timeout=60
                         )
                         
+                        print(f"Ollama status: {ollama_response.status_code}")
+                        print(f"Ollama response: {ollama_response.text}")
+
                         if ollama_response.status_code == 200:
                             ollama_data = ollama_response.json()
+                            content = ollama_data.get("message", {}).get("content", "")
                             
                             # Convert Ollama response to OpenAI format
                             openai_response = {
                                 "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
-                                "object": "chat.completion",
+                                "object": "chat.completion", 
                                 "created": int(datetime.now().timestamp()),
                                 "model": "phi3:mini",
                                 "choices": [
@@ -316,35 +155,46 @@ jobs:
                                         "index": 0,
                                         "message": {
                                             "role": "assistant",
-                                            "content": ollama_data.get("message", {}).get("content", "")
+                                            "content": content
                                         },
                                         "finish_reason": "stop"
                                     }
                                 ],
                                 "usage": {
-                                    "prompt_tokens": len(str(request_data.get("messages", []))),
-                                    "completion_tokens": len(ollama_data.get("message", {}).get("content", "")),
-                                    "total_tokens": len(str(request_data.get("messages", []))) + len(ollama_data.get("message", {}).get("content", ""))
+                                    "prompt_tokens": 100,
+                                    "completion_tokens": len(content.split()),
+                                    "total_tokens": 100 + len(content.split())
                                 }
                             }
                             
+                            print(f"Sending OpenAI response: {json.dumps(openai_response, indent=2)}")
+
                             self.send_response(200)
                             self.send_header('Content-Type', 'application/json')
                             self.end_headers()
                             self.wfile.write(json.dumps(openai_response).encode())
                         else:
-                            self.send_response(500)
+                            print(f"Ollama error: {ollama_response.status_code} - {ollama_response.text}")
+                            self.send_response(502)
+                            self.send_header('Content-Type', 'application/json')
                             self.end_headers()
-                    except Exception as e:
-                        print(f"Error: {e}")
-                        self.send_response(500)
+                            error_response = {"error": {"message": f"Ollama returned {ollama_response.status_code}", "type": "api_error"}}
+                            self.wfile.write(json.dumps(error_response).encode())
+                    else:
+                        self.send_response(404)
                         self.end_headers()
-                else:
-                    self.send_response(404)
+                        
+                except Exception as e:
+                    print(f"POST Error: {e}")
+                    traceback.print_exc()
+                    self.send_response(500)
+                    self.send_header('Content-Type', 'application/json')
                     self.end_headers()
+                    error_response = {"error": {"message": str(e), "type": "internal_error"}}
+                    self.wfile.write(json.dumps(error_response).encode())
 
             def log_message(self, format, *args):
-                pass  # Suppress log messages
+                print(f"[{datetime.now()}] {format % args}")
 
         if __name__ == '__main__':
             server = HTTPServer(('localhost', 8080), OllamaHandler)
@@ -352,17 +202,25 @@ jobs:
             server.serve_forever()
         EOF
 
-        # Start the bridge server
-        python3 ollama_bridge.py &
+        # Install required Python package
+        pip3 install requests
+
+        # Start the bridge server with logs
+        echo "Starting Ollama bridge..."
+        python3 ollama_bridge.py > bridge.log 2>&1 &
         BRIDGE_PID=$!
         echo "BRIDGE_PID=$BRIDGE_PID" >> $GITHUB_ENV
 
         # Wait for bridge to start
-        sleep 3
+        sleep 5
 
         # Test the bridge
         echo "Testing Ollama bridge..."
-        curl -s http://localhost:8080/v1/models | jq .
+        curl -v http://localhost:8080/v1/models | jq . || echo "Bridge test failed"
+        
+        # Show bridge logs
+        echo "Bridge logs:"
+        tail -n 20 bridge.log || echo "No bridge logs yet"
 
     - name: Run integration tests with Ollama
       env:

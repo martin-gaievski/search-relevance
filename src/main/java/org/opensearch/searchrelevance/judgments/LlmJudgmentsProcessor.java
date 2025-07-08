@@ -449,7 +449,35 @@ public class LlmJudgmentsProcessor implements BaseJudgmentsProcessor {
                         for (List<Map<String, Object>> ratings : combinedResponses.values()) {
                             for (Map<String, Object> rating : ratings) {
                                 String compositeKey = (String) rating.get("id");
-                                Double ratingScore = ((Number) rating.get("rating_score")).doubleValue();
+
+                                // Try multiple possible field names for the rating score
+                                Double ratingScore = null;
+                                Object scoreValue = rating.get("rating_score");
+                                if (scoreValue == null) {
+                                    scoreValue = rating.get("rating");
+                                }
+                                if (scoreValue == null) {
+                                    scoreValue = rating.get("score");
+                                }
+                                if (scoreValue == null) {
+                                    scoreValue = rating.get("relevance_score");
+                                }
+                                if (scoreValue == null) {
+                                    scoreValue = rating.get("relevance");
+                                }
+
+                                if (scoreValue != null && scoreValue instanceof Number) {
+                                    ratingScore = ((Number) scoreValue).doubleValue();
+                                } else {
+                                    log.warn(
+                                        "No valid rating score found for composite key: {}. Available fields: {}",
+                                        compositeKey,
+                                        rating.keySet()
+                                    );
+                                    // Skip this rating if no valid score found
+                                    continue;
+                                }
+
                                 String docId = getDocIdFromCompositeKey(compositeKey);
                                 processedRatings.put(docId, ratingScore.toString());
                                 updateJudgmentCache(compositeKey, queryTextWithReference, contextFields, ratingScore.toString(), modelId);

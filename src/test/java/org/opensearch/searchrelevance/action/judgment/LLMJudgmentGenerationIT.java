@@ -15,6 +15,8 @@ import java.io.IOException;
 import java.net.URISyntaxException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -98,7 +100,7 @@ public class LLMJudgmentGenerationIT extends BaseExperimentIT {
         try {
             String indexName = "test-products";
 
-            String createIndexBody = Files.readString(Path.of(classLoader.getResource("data/test-products-mapping.json").toURI()));
+            String createIndexBody = Files.readString(Path.of(classLoader.getResource("data/TestProductsIndexMapping.json").toURI()));
 
             makeRequest(
                 adminClient(),
@@ -109,7 +111,7 @@ public class LLMJudgmentGenerationIT extends BaseExperimentIT {
                 ImmutableList.of(new BasicHeader(HttpHeaders.USER_AGENT, DEFAULT_USER_AGENT))
             );
 
-            String importDatasetBody = Files.readString(Path.of(classLoader.getResource("data/test-products-documents.json").toURI()));
+            String importDatasetBody = Files.readString(Path.of(classLoader.getResource("data/TestProductsIngestDocuments.json").toURI()));
             importDatasetBody = importDatasetBody.replace("{{index_name}}", indexName);
             bulkIngest(indexName, importDatasetBody);
 
@@ -239,66 +241,157 @@ public class LLMJudgmentGenerationIT extends BaseExperimentIT {
         assertFalse("Judgment ratings list should not be empty", judgmentRatings.isEmpty());
 
         boolean foundRatingGreaterThanZero = false;
-        int queryIndex = 0;
 
         for (Map<String, Object> judgment : judgmentRatings) {
-            queryIndex++;
             String query = (String) judgment.get("query");
             assertNotNull("Query should not be null", query);
-
-            System.out.println(String.format("Query #%d: \"%s\"", queryIndex, query));
 
             List<Map<String, Object>> ratings = (List<Map<String, Object>>) judgment.get("ratings");
             assertNotNull("Ratings should not be null", ratings);
 
-            if (ratings.isEmpty()) {
-                System.out.println("  ⚠️  NO RATINGS RETURNED - Empty ratings list!");
-            } else {
-                System.out.println(String.format("  Ratings count: %d", ratings.size()));
-                
-                boolean queryHasNonZeroRating = false;
-                for (int i = 0; i < ratings.size(); i++) {
-                    Map<String, Object> rating = ratings.get(i);
+            if (!ratings.isEmpty()) {
+                for (Map<String, Object> rating : ratings) {
                     assertNotNull("Doc ID should not be null", rating.get("docId"));
                     assertNotNull("Rating should not be null", rating.get("rating"));
 
-                    String docId = rating.get("docId").toString();
                     String ratingStr = rating.get("rating").toString();
                     double ratingValue = Double.parseDouble(ratingStr);
-                    
+
                     assertTrue("Rating should be between 0.0 and 1.0", ratingValue >= 0.0 && ratingValue <= 1.0);
 
-                    if (ratingValue == 0.0) {
-                        System.out.println(String.format("    [%d] Doc: %s → Rating: %.2f ❌ (ZERO RATING)", 
-                            i + 1, docId, ratingValue));
-                    } else {
-                        System.out.println(String.format("    [%d] Doc: %s → Rating: %.2f ✅", 
-                            i + 1, docId, ratingValue));
+                    if (ratingValue > 0.0) {
                         foundRatingGreaterThanZero = true;
-                        queryHasNonZeroRating = true;
                     }
                 }
-                
-                if (!queryHasNonZeroRating) {
-                    System.out.println("  ❌ ALL RATINGS ARE ZERO for this query!");
-                } else {
-                    System.out.println("  ✅ Query has at least one non-zero rating");
-                }
             }
-            System.out.println(); // Empty line for readability
-        }
-
-        // Summary output
-        System.out.println("========== SUMMARY ==========");
-        if (foundRatingGreaterThanZero) {
-            System.out.println("✅ SUCCESS: Found at least one rating > 0.0");
-            System.out.println("✅ Model is generating meaningful relevance scores");
-        } else {
-            System.out.println("❌ FAILURE: ALL RATINGS ARE ZERO!");
-            System.out.println("❌ Model may be too weak or misconfigured");
         }
 
         assertTrue("At least one rating should be greater than 0.0", foundRatingGreaterThanZero);
+
+        // Advanced validation of judgment quality
+        validateJudgmentQuality(judgmentRatings);
+    }
+
+    private void validateJudgmentQuality(List<Map<String, Object>> judgmentRatings) {
+        // Statistics tracking
+        int totalQueries = judgmentRatings.size();
+        int queriesWithRatings = 0;
+        int totalRatings = 0;
+        double sumRatings = 0.0;
+        double minRating = 1.0;
+        double maxRating = 0.0;
+
+        Map<String, Integer> ratingDistribution = new HashMap<>();
+        List<Double> allRatings = new ArrayList<>();
+
+        // Collect all ratings for analysis
+        for (Map<String, Object> judgment : judgmentRatings) {
+            List<Map<String, Object>> ratings = (List<Map<String, Object>>) judgment.get("ratings");
+
+            if (!ratings.isEmpty()) {
+                queriesWithRatings++;
+
+                for (Map<String, Object> rating : ratings) {
+                    double ratingValue = Double.parseDouble(rating.get("rating").toString());
+                    totalRatings++;
+                    sumRatings += ratingValue;
+                    allRatings.add(ratingValue);
+
+                    minRating = Math.min(minRating, ratingValue);
+                    maxRating = Math.max(maxRating, ratingValue);
+
+                    // Rating distribution buckets
+                    String bucket = getRatingBucket(ratingValue);
+                    ratingDistribution.put(bucket, ratingDistribution.getOrDefault(bucket, 0) + 1);
+                }
+            }
+        }
+
+        double avgRating = totalRatings > 0 ? sumRatings / totalRatings : 0.0;
+        double coverage = (double) queriesWithRatings / totalQueries * 100.0;
+
+        // Calculate standard deviation
+        double variance = 0.0;
+        if (totalRatings > 1) {
+            for (double rating : allRatings) {
+                variance += Math.pow(rating - avgRating, 2);
+            }
+            variance /= (totalRatings - 1);
+        }
+        double stdDev = Math.sqrt(variance);
+
+        // Quality assertions
+        assertTrue("Should have meaningful query coverage (>= 50%)", coverage >= 50.0);
+        assertTrue("Should have substantial number of ratings (>= 10)", totalRatings >= 10);
+        assertTrue("Average rating should be reasonable (0.3-0.8)", avgRating >= 0.3 && avgRating <= 0.8);
+        assertTrue("Should have rating diversity (std dev >= 0.15)", stdDev >= 0.15);
+        assertTrue("Rating range should be meaningful (>= 0.4)", (maxRating - minRating) >= 0.4);
+
+        // Distribution assertions
+        int lowRatings = ratingDistribution.getOrDefault("Low (0.0-0.4)", 0);
+        int mediumRatings = ratingDistribution.getOrDefault("Medium (0.4-0.7)", 0);
+        int highRatings = ratingDistribution.getOrDefault("High (0.7-1.0)", 0);
+
+        assertTrue(
+            "Should have varied rating distribution",
+            (lowRatings > 0 ? 1 : 0) + (mediumRatings > 0 ? 1 : 0) + (highRatings > 0 ? 1 : 0) >= 2
+        );
+
+        // Relevance logic validation
+        validateRelevanceLogic(judgmentRatings);
+    }
+
+    private String getRatingBucket(double rating) {
+        if (rating < 0.4) return "Low (0.0-0.4)";
+        else if (rating < 0.7) return "Medium (0.4-0.7)";
+        else return "High (0.7-1.0)";
+    }
+
+    private void validateRelevanceLogic(List<Map<String, Object>> judgmentRatings) {
+        for (Map<String, Object> judgment : judgmentRatings) {
+            String query = (String) judgment.get("query");
+            List<Map<String, Object>> ratings = (List<Map<String, Object>>) judgment.get("ratings");
+
+            if (ratings.size() > 1) {
+                // Check for meaningful rating differences within query
+                double maxRating = ratings.stream().mapToDouble(r -> Double.parseDouble(r.get("rating").toString())).max().orElse(0.0);
+                double minRating = ratings.stream().mapToDouble(r -> Double.parseDouble(r.get("rating").toString())).min().orElse(0.0);
+
+                double ratingSpread = maxRating - minRating;
+
+                // Validate that LLM shows discrimination (not all ratings identical)
+                boolean hasVariation = ratingSpread >= 0.1; // At least 0.1 difference
+                assertTrue(String.format("Low variation for query '%s'", query), hasVariation);
+            }
+        }
+
+        // Special validation for specific query types
+        validateSpecificQueries(judgmentRatings);
+    }
+
+    private void validateSpecificQueries(List<Map<String, Object>> judgmentRatings) {
+        for (Map<String, Object> judgment : judgmentRatings) {
+            String query = (String) judgment.get("query");
+            List<Map<String, Object>> ratings = (List<Map<String, Object>>) judgment.get("ratings");
+
+            if (ratings.isEmpty()) continue;
+
+            double avgRating = ratings.stream().mapToDouble(r -> Double.parseDouble(r.get("rating").toString())).average().orElse(0.0);
+
+            switch (query.toLowerCase()) {
+                case "iphone":
+                    assertTrue(String.format("iPhone query should have good relevance (avg=%.3f)", avgRating), avgRating >= 0.5);
+                    break;
+
+                case "metal frame":
+                    assertTrue(String.format("Metal frame query should have good relevance (avg=%.3f)", avgRating), avgRating >= 0.5);
+                    break;
+
+                case "phone":
+                    assertTrue(String.format("Phone query should have moderate relevance (avg=%.3f)", avgRating), avgRating >= 0.4);
+                    break;
+            }
+        }
     }
 
     private void deleteLLMJudgments(String judgmentsId) throws IOException {
