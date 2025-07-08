@@ -123,7 +123,7 @@ jobs:
           kill $MOCK_SERVER_PID || true
         fi
 
-  # Alternative job using llamafile (single binary, ~4GB but faster than LocalAI)
+  # Alternative job using llamafile with TinyLlama (lightweight, fast startup)
   test-with-llamafile:
     runs-on: ubuntu-latest
     # if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -137,28 +137,43 @@ jobs:
         java-version: '21'
         distribution: 'temurin'
 
-    - name: Setup Llamafile
+    - name: Setup Llamafile with TinyLlama
       run: |
-        # Download TinyLlama llamafile (smallest available, ~600MB)
-        wget -q https://huggingface.co/jartine/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/TinyLlama-1.1B-Chat-v1.0.Q4_K_M.llamafile
+        # Download TinyLlama llamafile (~600MB, fast startup)
+        echo "Downloading TinyLlama llamafile..."
+        wget -q --show-progress https://huggingface.co/jartine/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/TinyLlama-1.1B-Chat-v1.0.Q4_K_M.llamafile
         chmod +x TinyLlama-1.1B-Chat-v1.0.Q4_K_M.llamafile
 
         # Start llamafile server
+        echo "Starting TinyLlama server..."
         ./TinyLlama-1.1B-Chat-v1.0.Q4_K_M.llamafile --server --port 8080 --nobrowser &
         LLAMAFILE_PID=$!
         echo "LLAMAFILE_PID=$LLAMAFILE_PID" >> $GITHUB_ENV
 
-        # Wait for server to start (may take a minute)
-        echo "Waiting for llamafile to start..."
+        # Wait for server to start
+        echo "Waiting for TinyLlama to start..."
         for i in {1..60}; do
           if curl -s http://localhost:8080/v1/models > /dev/null; then
-            echo "Llamafile started successfully"
+            echo "TinyLlama started successfully"
+            # Test that the model responds properly
+            curl -s http://localhost:8080/v1/models | jq .
             break
           fi
+          echo "Attempt $i/60: Still waiting..."
           sleep 2
         done
 
-    - name: Run integration tests with Llamafile
+        # Verify the model is working
+        echo "Testing TinyLlama API..."
+        curl -X POST http://localhost:8080/v1/chat/completions \
+          -H "Content-Type: application/json" \
+          -d '{
+            "model": "TinyLlama-1.1B-Chat-v1.0",
+            "messages": [{"role": "user", "content": "Hello, are you working?"}],
+            "max_tokens": 50
+          }' | jq .
+
+    - name: Run integration tests with TinyLlama
       env:
         LOCALAI_API_URL: http://localhost:8080
         LLM_MODEL_NAME: TinyLlama-1.1B-Chat-v1.0
@@ -169,5 +184,6 @@ jobs:
       if: always()
       run: |
         if [ ! -z "$LLAMAFILE_PID" ]; then
+          echo "Stopping TinyLlama server..."
           kill $LLAMAFILE_PID || true
         fi
