@@ -239,28 +239,63 @@ public class LLMJudgmentGenerationIT extends BaseExperimentIT {
         assertFalse("Judgment ratings list should not be empty", judgmentRatings.isEmpty());
 
         boolean foundRatingGreaterThanZero = false;
+        int queryIndex = 0;
 
         for (Map<String, Object> judgment : judgmentRatings) {
+            queryIndex++;
             String query = (String) judgment.get("query");
             assertNotNull("Query should not be null", query);
+
+            System.out.println(String.format("Query #%d: \"%s\"", queryIndex, query));
 
             List<Map<String, Object>> ratings = (List<Map<String, Object>>) judgment.get("ratings");
             assertNotNull("Ratings should not be null", ratings);
 
-            if (!ratings.isEmpty()) {
-                for (Map<String, Object> rating : ratings) {
+            if (ratings.isEmpty()) {
+                System.out.println("  ⚠️  NO RATINGS RETURNED - Empty ratings list!");
+            } else {
+                System.out.println(String.format("  Ratings count: %d", ratings.size()));
+                
+                boolean queryHasNonZeroRating = false;
+                for (int i = 0; i < ratings.size(); i++) {
+                    Map<String, Object> rating = ratings.get(i);
                     assertNotNull("Doc ID should not be null", rating.get("docId"));
                     assertNotNull("Rating should not be null", rating.get("rating"));
 
+                    String docId = rating.get("docId").toString();
                     String ratingStr = rating.get("rating").toString();
                     double ratingValue = Double.parseDouble(ratingStr);
+                    
                     assertTrue("Rating should be between 0.0 and 1.0", ratingValue >= 0.0 && ratingValue <= 1.0);
 
-                    if (ratingValue > 0.0) {
+                    if (ratingValue == 0.0) {
+                        System.out.println(String.format("    [%d] Doc: %s → Rating: %.2f ❌ (ZERO RATING)", 
+                            i + 1, docId, ratingValue));
+                    } else {
+                        System.out.println(String.format("    [%d] Doc: %s → Rating: %.2f ✅", 
+                            i + 1, docId, ratingValue));
                         foundRatingGreaterThanZero = true;
+                        queryHasNonZeroRating = true;
                     }
                 }
+                
+                if (!queryHasNonZeroRating) {
+                    System.out.println("  ❌ ALL RATINGS ARE ZERO for this query!");
+                } else {
+                    System.out.println("  ✅ Query has at least one non-zero rating");
+                }
             }
+            System.out.println(); // Empty line for readability
+        }
+
+        // Summary output
+        System.out.println("========== SUMMARY ==========");
+        if (foundRatingGreaterThanZero) {
+            System.out.println("✅ SUCCESS: Found at least one rating > 0.0");
+            System.out.println("✅ Model is generating meaningful relevance scores");
+        } else {
+            System.out.println("❌ FAILURE: ALL RATINGS ARE ZERO!");
+            System.out.println("❌ Model may be too weak or misconfigured");
         }
 
         assertTrue("At least one rating should be greater than 0.0", foundRatingGreaterThanZero);

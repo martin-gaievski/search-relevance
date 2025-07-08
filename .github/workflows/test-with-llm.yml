@@ -187,3 +187,198 @@ jobs:
           echo "Stopping TinyLlama server..."
           kill $LLAMAFILE_PID || true
         fi
+
+  # Third job using Ollama with a lightweight model
+  test-with-ollama:
+    runs-on: ubuntu-latest
+    # if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up JDK 21
+      uses: actions/setup-java@v4
+      with:
+        java-version: '21'
+        distribution: 'temurin'
+
+    - name: Setup Ollama
+      run: |
+        # Download and install Ollama
+        echo "Installing Ollama..."
+        curl -fsSL https://ollama.com/install.sh | sh
+        
+        # Start Ollama service in background
+        echo "Starting Ollama service..."
+        ollama serve &
+        OLLAMA_PID=$!
+        echo "OLLAMA_PID=$OLLAMA_PID" >> $GITHUB_ENV
+        
+        # Wait for Ollama to be ready
+        echo "Waiting for Ollama to start..."
+        for i in {1..30}; do
+          if curl -s http://localhost:11434/api/version > /dev/null; then
+            echo "Ollama service started successfully"
+            break
+          fi
+          echo "Attempt $i/30: Still waiting..."
+          sleep 2
+        done
+
+        # Pull a lightweight model (phi3:mini is good balance of size/quality)
+        echo "Pulling Phi-3 mini model..."
+        ollama pull phi3:mini
+        
+        # Verify model is available
+        echo "Available models:"
+        ollama list
+
+    - name: Test Ollama API
+      run: |
+        # Test Ollama API compatibility
+        echo "Testing Ollama API..."
+        
+        # Test models endpoint
+        curl -s http://localhost:11434/api/tags | jq .
+        
+        # Test chat completion
+        curl -s -X POST http://localhost:11434/api/chat \
+          -H "Content-Type: application/json" \
+          -d '{
+            "model": "phi3:mini",
+            "messages": [{"role": "user", "content": "Hello! Are you working?"}],
+            "stream": false
+          }' | jq .
+
+    - name: Create Ollama Bridge
+      run: |
+        # Create a bridge server to make Ollama compatible with OpenAI API format
+        cat > ollama_bridge.py <<'EOF'
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+        import json
+        import requests
+        import uuid
+        from datetime import datetime
+
+        class OllamaHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == '/v1/models':
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    response = {
+                        "data": [
+                            {
+                                "id": "phi3:mini",
+                                "object": "model",
+                                "created": int(datetime.now().timestamp()),
+                                "owned_by": "ollama"
+                            }
+                        ]
+                    }
+                    self.wfile.write(json.dumps(response).encode())
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def do_POST(self):
+                content_length = int(self.headers['Content-Length'])
+                post_data = self.rfile.read(content_length)
+                request_data = json.loads(post_data.decode('utf-8'))
+
+                if self.path == '/v1/chat/completions':
+                    try:
+                        # Convert OpenAI format to Ollama format
+                        ollama_request = {
+                            "model": "phi3:mini",
+                            "messages": request_data.get("messages", []),
+                            "stream": False
+                        }
+                        
+                        # Call Ollama API
+                        ollama_response = requests.post(
+                            "http://localhost:11434/api/chat",
+                            json=ollama_request,
+                            timeout=30
+                        )
+                        
+                        if ollama_response.status_code == 200:
+                            ollama_data = ollama_response.json()
+                            
+                            # Convert Ollama response to OpenAI format
+                            openai_response = {
+                                "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+                                "object": "chat.completion",
+                                "created": int(datetime.now().timestamp()),
+                                "model": "phi3:mini",
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "message": {
+                                            "role": "assistant",
+                                            "content": ollama_data.get("message", {}).get("content", "")
+                                        },
+                                        "finish_reason": "stop"
+                                    }
+                                ],
+                                "usage": {
+                                    "prompt_tokens": len(str(request_data.get("messages", []))),
+                                    "completion_tokens": len(ollama_data.get("message", {}).get("content", "")),
+                                    "total_tokens": len(str(request_data.get("messages", []))) + len(ollama_data.get("message", {}).get("content", ""))
+                                }
+                            }
+                            
+                            self.send_response(200)
+                            self.send_header('Content-Type', 'application/json')
+                            self.end_headers()
+                            self.wfile.write(json.dumps(openai_response).encode())
+                        else:
+                            self.send_response(500)
+                            self.end_headers()
+                    except Exception as e:
+                        print(f"Error: {e}")
+                        self.send_response(500)
+                        self.end_headers()
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def log_message(self, format, *args):
+                pass  # Suppress log messages
+
+        if __name__ == '__main__':
+            server = HTTPServer(('localhost', 8080), OllamaHandler)
+            print("Ollama bridge server started on http://localhost:8080")
+            server.serve_forever()
+        EOF
+
+        # Start the bridge server
+        python3 ollama_bridge.py &
+        BRIDGE_PID=$!
+        echo "BRIDGE_PID=$BRIDGE_PID" >> $GITHUB_ENV
+
+        # Wait for bridge to start
+        sleep 3
+
+        # Test the bridge
+        echo "Testing Ollama bridge..."
+        curl -s http://localhost:8080/v1/models | jq .
+
+    - name: Run integration tests with Ollama
+      env:
+        LOCALAI_API_URL: http://localhost:8080
+        LLM_MODEL_NAME: phi3:mini
+      run: |
+        ./gradlew integTest --tests "*LLMJudgmentGenerationIT" -Dtests.cluster.llm.enabled=true
+
+    - name: Stop Ollama and Bridge
+      if: always()
+      run: |
+        if [ ! -z "$BRIDGE_PID" ]; then
+          echo "Stopping Ollama bridge..."
+          kill $BRIDGE_PID || true
+        fi
+        if [ ! -z "$OLLAMA_PID" ]; then
+          echo "Stopping Ollama service..."
+          kill $OLLAMA_PID || true
+        fi
