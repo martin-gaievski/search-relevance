@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Local Ollama Setup Script  
-# This script sets up the same Ollama environment as the GitHub Action for local testing
+# Local Ollama Setup Script - Native OpenAI API Compatibility
+# This script sets up Ollama with native OpenAI-compatible endpoints
 # Usage: ./scripts/setup-local-ollama.sh [MODEL_NAME]
 # Models: phi3:mini (default), llama3.2:3b, qwen2.5:7b, llama3.1:8b, mistral:7b
 
@@ -24,7 +24,7 @@ get_model_info() {
             case "$field" in
                 "name") echo "tinyllama" ;;
                 "size") echo "~637MB" ;;
-                "desc") echo "TinyLlama 1.1B - ⚡ Ultra-fast for CI/testing" ;;
+                "desc") echo "TinyLlama 1.1B - Ultra-fast for CI/testing" ;;
             esac
             ;;
         "phi3:mini")
@@ -70,15 +70,15 @@ get_model_info() {
 
 # Validate model choice
 if ! get_model_info "$MODEL_CHOICE" "name" >/dev/null 2>&1; then
-    echo "❌ Unknown model: $MODEL_CHOICE"
+    echo "Unknown model: $MODEL_CHOICE"
     echo ""
     echo "Available models:"
-    echo "  tinyllama    - TinyLlama 1.1B (~637MB) - ⚡ Ultra-fast for CI/testing"
-    echo "  phi3:mini    - Microsoft Phi-3 Mini (~2.3GB) - ⭐ Recommended balance"
-    echo "  llama3.2:3b - Llama 3.2 3B (~2.0GB) - ✅ Good for low RAM"
-    echo "  qwen2.5:7b  - Qwen2.5 7B (~4.1GB) - 🧠 Excellent reasoning"
-    echo "  llama3.1:8b - Llama 3.1 8B (~4.6GB) - 🏆 High quality"
-    echo "  mistral:7b  - Mistral 7B (~4.1GB) - 🎓 Reasoning expert"
+    echo "  tinyllama    - TinyLlama 1.1B (~637MB) - Ultra-fast for CI/testing"
+    echo "  phi3:mini    - Microsoft Phi-3 Mini (~2.3GB) - Recommended balance"
+    echo "  llama3.2:3b - Llama 3.2 3B (~2.0GB) - Good for low RAM"
+    echo "  qwen2.5:7b  - Qwen2.5 7B (~4.1GB) - Excellent reasoning"
+    echo "  llama3.1:8b - Llama 3.1 8B (~4.6GB) - High quality"
+    echo "  mistral:7b  - Mistral 7B (~4.1GB) - Reasoning expert"
     echo ""
     echo "Usage: ./scripts/setup-local-ollama.sh [MODEL_NAME]"
     echo "Example: ./scripts/setup-local-ollama.sh phi3:mini"
@@ -92,19 +92,52 @@ MODEL_DESC="$(get_model_info "$MODEL_CHOICE" "desc")"
 echo "=== Setting up Local Ollama Environment ==="
 echo "Model: $MODEL_CHOICE ($MODEL_DESC)"
 echo "Size: $MODEL_SIZE"
+echo "Using Ollama's native OpenAI API compatibility!"
 echo ""
 
 # Create Ollama directory
 mkdir -p "$OLLAMA_DIR"
 cd "$OLLAMA_DIR"
 
-# Check if Ollama is installed
+# Check if Ollama is installed and version
+MINIMUM_VERSION="0.1.14"
+
 if ! command -v ollama &> /dev/null; then
     echo "Installing Ollama..."
     curl -fsSL https://ollama.com/install.sh | sh
     echo "Ollama installed successfully"
 else
     echo "Ollama already installed"
+    
+    # Check Ollama version for OpenAI API compatibility
+    echo "Checking Ollama version for OpenAI API compatibility..."
+    OLLAMA_VERSION=$(ollama --version 2>/dev/null | grep -oE "v?[0-9]+\.[0-9]+\.[0-9]+" | head -1 | sed 's/^v//')
+    
+    if [ -z "$OLLAMA_VERSION" ]; then
+        echo "Could not determine Ollama version"
+        echo "   Proceeding with setup, but OpenAI API may not work if version < $MINIMUM_VERSION"
+    else
+        echo "Detected Ollama version: $OLLAMA_VERSION"
+        
+        # Simple version comparison (works for most semantic versions)
+        if printf '%s\n%s\n' "$MINIMUM_VERSION" "$OLLAMA_VERSION" | sort -V | head -1 | grep -q "^$MINIMUM_VERSION$"; then
+            echo "Ollama $OLLAMA_VERSION supports native OpenAI API compatibility"
+        else
+            echo "Ollama $OLLAMA_VERSION is too old for native OpenAI API compatibility"
+            echo ""
+            echo "Required: >= $MINIMUM_VERSION (native OpenAI API support)"
+            echo "Current:  $OLLAMA_VERSION"
+            echo ""
+            echo "Please update Ollama:"
+            echo "  curl -fsSL https://ollama.com/install.sh | sh"
+            echo ""
+            echo "Or manually:"
+            echo "  brew upgrade ollama        # macOS with Homebrew"
+            echo "  sudo apt update && sudo apt upgrade ollama  # Ubuntu/Debian"
+            echo ""
+            exit 1
+        fi
+    fi
 fi
 
 # Check if Ollama service is already running
@@ -147,165 +180,67 @@ echo ""
 echo "Available models:"
 ollama list
 
-# Test Ollama API
+# Test Ollama's native OpenAI API
 echo ""
-echo "Testing Ollama API..."
-curl -s -X POST http://localhost:11434/api/chat \
+echo "Testing Ollama's native OpenAI API..."
+curl -s -X POST http://localhost:11434/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d "{
     \"model\": \"$MODEL_NAME\",
-    \"messages\": [{\"role\": \"user\", \"content\": \"Hello! Are you working?\"}],
-    \"stream\": false
-  }" | jq -r '.message.content' 2>/dev/null || echo "API test completed"
+    \"messages\": [{\"role\": \"user\", \"content\": \"Hello! Test OpenAI API compatibility.\"}],
+    \"max_tokens\": 50
+  }" | jq -r '.choices[0].message.content' 2>/dev/null || echo "OpenAI API test completed"
 
-# Create Ollama bridge (same as GitHub Actions)
 echo ""
-echo "Creating Ollama bridge for OpenAI compatibility..."
-cat > "$OLLAMA_DIR/ollama_bridge.py" <<EOF
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import json
-import requests
-import uuid
-from datetime import datetime
-import sys
+echo "Testing models endpoint..."
+curl -s http://localhost:11434/v1/models | jq -r '.data[0].id' 2>/dev/null || echo "Models endpoint test completed"
 
-class OllamaHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == '/v1/models':
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            response = {
-                "data": [
-                    {
-                        "id": "$MODEL_NAME",
-                        "object": "model",
-                        "created": int(datetime.now().timestamp()),
-                        "owned_by": "ollama"
-                    }
-                ]
-            }
-            self.wfile.write(json.dumps(response).encode())
-        else:
-            self.send_response(404)
-            self.end_headers()
+# Create environment configuration for easy access
+cat > "$OLLAMA_DIR/config.env" <<EOF
+# Ollama Configuration
+export OLLAMA_MODEL_NAME="$MODEL_NAME"
+export OLLAMA_API_BASE="http://localhost:11434/v1"
+export OLLAMA_API_KEY="dummy"  # Not required but some clients expect it
 
-    def do_POST(self):
-        content_length = int(self.headers['Content-Length'])
-        post_data = self.rfile.read(content_length)
-        request_data = json.loads(post_data.decode('utf-8'))
+# For ML-Commons connector
+export ML_COMMONS_ENDPOINT="http://localhost:11434/v1/chat/completions"
+export ML_COMMONS_MODEL="$MODEL_NAME"
 
-        if self.path == '/v1/chat/completions':
-            try:
-                # Convert OpenAI format to Ollama format
-                ollama_request = {
-                    "model": "$MODEL_NAME",
-                    "messages": request_data.get("messages", []),
-                    "stream": False
-                }
-                
-                # Call Ollama API
-                ollama_response = requests.post(
-                    "http://localhost:11434/api/chat",
-                    json=ollama_request,
-                    timeout=30
-                )
-                
-                if ollama_response.status_code == 200:
-                    ollama_data = ollama_response.json()
-                    
-                    # Convert Ollama response to OpenAI format
-                    openai_response = {
-                        "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
-                        "object": "chat.completion",
-                        "created": int(datetime.now().timestamp()),
-                        "model": "$MODEL_NAME",
-                        "choices": [
-                            {
-                                "index": 0,
-                                "message": {
-                                    "role": "assistant",
-                                    "content": ollama_data.get("message", {}).get("content", "")
-                                },
-                                "finish_reason": "stop"
-                            }
-                        ],
-                        "usage": {
-                            "prompt_tokens": len(str(request_data.get("messages", []))),
-                            "completion_tokens": len(ollama_data.get("message", {}).get("content", "")),
-                            "total_tokens": len(str(request_data.get("messages", []))) + len(ollama_data.get("message", {}).get("content", ""))
-                        }
-                    }
-                    
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'application/json')
-                    self.end_headers()
-                    self.wfile.write(json.dumps(openai_response).encode())
-                else:
-                    self.send_response(500)
-                    self.end_headers()
-            except Exception as e:
-                print(f"Error: {e}", file=sys.stderr)
-                self.send_response(500)
-                self.end_headers()
-        else:
-            self.send_response(404)
-            self.end_headers()
-
-    def log_message(self, format, *args):
-        pass  # Suppress log messages
-
-if __name__ == '__main__':
-    server = HTTPServer(('localhost', 8080), OllamaHandler)
-    print("Ollama bridge server started on http://localhost:8080")
-    server.serve_forever()
+# Source this file to set environment variables:
+# source .ollama/config.env
 EOF
 
-# Check if bridge is already running
-if curl -s http://localhost:8080/v1/models > /dev/null 2>&1; then
-    echo "⚠️  Bridge server already running on port 8080"
-else
-    echo "Starting Ollama bridge on http://localhost:8080..."
-    python3 "$OLLAMA_DIR/ollama_bridge.py" > "$OLLAMA_DIR/bridge.log" 2>&1 &
-    BRIDGE_PID=$!
-    echo $BRIDGE_PID > "$OLLAMA_DIR/bridge.pid"
-    
-    # Wait for bridge to start
-    sleep 3
-    
-    # Test the bridge
-    echo "Testing Ollama bridge..."
-    if curl -s http://localhost:8080/v1/models > /dev/null 2>&1; then
-        echo "Ollama bridge started successfully"
-    else
-        echo "Failed to start Ollama bridge"
-        exit 1
-    fi
-fi
-
 echo ""
-echo "🎉 Local Ollama Environment Ready!"
+echo "Local Ollama Environment Ready!"
 echo ""
-echo "Server Info:"
-echo "  Ollama API: http://localhost:11434"
-echo "  Bridge API: http://localhost:8080 (OpenAI-compatible)"
-echo "  Model: $MODEL_NAME"
+echo "Native OpenAI-Compatible Endpoints:"
+echo "  Chat Completions: http://localhost:11434/v1/chat/completions"
+echo "  Models List:      http://localhost:11434/v1/models"
+echo "  Embeddings:       http://localhost:11434/v1/embeddings"
+echo ""
+echo "Model Information:"
+echo "  Name: $MODEL_NAME"
 echo "  Description: $MODEL_DESC"
 echo "  Size: $MODEL_SIZE"
 echo ""
-echo "PIDs:"
+echo "Configuration:"
+echo "  Environment: .ollama/config.env"
 if [ -f "$OLLAMA_DIR/ollama.pid" ]; then
-    echo "  Ollama: $(cat $OLLAMA_DIR/ollama.pid)"
-fi
-if [ -f "$OLLAMA_DIR/bridge.pid" ]; then
-    echo "  Bridge: $(cat $OLLAMA_DIR/bridge.pid)"
+    echo "  Ollama PID: $(cat $OLLAMA_DIR/ollama.pid)"
 fi
 echo ""
-echo "Logs:"
-echo "  Bridge: $OLLAMA_DIR/bridge.log"
+echo "Quick Test Commands:"
+echo "  # Test chat completion"
+echo "  curl http://localhost:11434/v1/chat/completions \\"
+echo "    -H 'Content-Type: application/json' \\"
+echo "    -d '{\"model\":\"$MODEL_NAME\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello!\"}]}'"
+echo ""
+echo "  # List available models"
+echo "  curl http://localhost:11434/v1/models"
 echo ""
 echo "Next Steps:"
-echo "  1. Run LLM tests: ./scripts/test-llm-local.sh"
-echo "  2. Stop services: ./scripts/stop-local-ollama.sh"
-echo "  3. View bridge logs: tail -f $OLLAMA_DIR/bridge.log"
+echo "  1. Source config: source .ollama/config.env"
+echo "  2. Run tests: ./gradlew integTest --tests '*LLMJudgmentGenerationIT*'"
+echo "  3. Stop service: ./scripts/stop-local-ollama.sh"
 echo ""
+echo "No bridge needed - Ollama has native OpenAI compatibility!"

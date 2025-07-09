@@ -241,8 +241,10 @@ public class LLMJudgmentGenerationIT extends BaseExperimentIT {
         assertNotNull("Judgment ratings should not be null", judgmentRatings);
         assertFalse("Judgment ratings list should not be empty", judgmentRatings.isEmpty());
 
-        // Simple validation - just check we got some ratings with valid structure
         int totalRatingsFound = 0;
+        int nonZeroRatingsFound = 0;
+        double totalRatingSum = 0.0;
+
         for (Map<String, Object> judgment : judgmentRatings) {
             String query = (String) judgment.get("query");
             assertNotNull("Query should not be null", query);
@@ -250,22 +252,35 @@ public class LLMJudgmentGenerationIT extends BaseExperimentIT {
             List<Map<String, Object>> ratings = (List<Map<String, Object>>) judgment.get("ratings");
             assertNotNull("Ratings should not be null", ratings);
 
-            // Count ratings and validate basic structure
             for (Map<String, Object> rating : ratings) {
                 assertNotNull("Doc ID should not be null", rating.get("docId"));
                 assertNotNull("Rating should not be null", rating.get("rating"));
 
-                // Verify rating is a valid number >= 0 (very basic validation)
                 String ratingStr = rating.get("rating").toString();
                 double ratingValue = Double.parseDouble(ratingStr);
+
+                // Verify rating bounds
                 assertTrue("Rating should be non-negative", ratingValue >= 0.0);
+                assertTrue("Rating should be <= 1.0", ratingValue <= 1.0);
 
                 totalRatingsFound++;
+                totalRatingSum += ratingValue;
+
+                if (ratingValue > 0.0) {
+                    nonZeroRatingsFound++;
+                }
             }
         }
 
-        // Just verify we got some ratings (very lenient for tiny model)
-        assertTrue("Should have at least one rating", totalRatingsFound > 0);
+        assertTrue("Should have generated ratings", totalRatingsFound > 0);
+        assertTrue(nonZeroRatingsFound > 0);
+
+        double avgRating = totalRatingSum / totalRatingsFound;
+        assertTrue("Average rating should be reasonable", avgRating > 0.4);
+        assertTrue("Average rating should not be too high", avgRating < 0.9);
+
+        double nonZeroPercentage = (nonZeroRatingsFound * 100.0) / totalRatingsFound;
+        assertTrue("LLM should generate high percentage of non-zero ratings", nonZeroPercentage > 80.0);
     }
 
     private void deleteLLMJudgments(String judgmentsId) throws IOException {
@@ -513,17 +528,32 @@ public class LLMJudgmentGenerationIT extends BaseExperimentIT {
     }
 
     private String getLLMApiUrl() {
-        String apiUrl = System.getenv("LOCALAI_API_URL");
+        // Check new Ollama environment variables first (from setup script)
+        String apiUrl = System.getenv("OLLAMA_API_BASE");
+        if (apiUrl != null && !apiUrl.isEmpty()) {
+            // Remove /v1 suffix if present since we add it back in the connector
+            return apiUrl.replace("/v1", "");
+        }
+
+        // Fallback to old environment variable for backward compatibility
+        apiUrl = System.getenv("LOCALAI_API_URL");
         if (apiUrl == null || apiUrl.isEmpty()) {
-            apiUrl = System.getProperty("tests.cluster.llm.api.url", "http://localhost:8080");
+            apiUrl = System.getProperty("tests.cluster.llm.api.url", "http://localhost:11434");
         }
         return apiUrl;
     }
 
     private String getLLMModelName() {
-        String modelName = System.getenv("LLM_MODEL_NAME");
+        String modelName = System.getenv("OLLAMA_MODEL_NAME");
+        if (modelName != null && !modelName.isEmpty()) {
+            return modelName;
+        }
+
+        // Fallback to old environment variable for backward compatibility
+        modelName = System.getenv("LLM_MODEL_NAME");
         if (modelName == null || modelName.isEmpty()) {
-            modelName = System.getProperty("tests.cluster.llm.model.name", "phi-2");
+            // Updated default: Use tinyllama (fast model for testing)
+            modelName = System.getProperty("tests.cluster.llm.model.name", "tinyllama");
         }
         return modelName;
     }
