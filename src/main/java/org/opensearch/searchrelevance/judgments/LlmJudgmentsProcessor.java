@@ -317,7 +317,7 @@ public class LlmJudgmentsProcessor implements BaseJudgmentsProcessor {
         List<String> docIds,
         ConcurrentMap<String, String> docIdToScore,
         boolean ignoreFailure
-    ) throws Exception {
+    ) {
         List<String> processedDocIds = Collections.synchronizedList(new ArrayList<>());
         AtomicBoolean hasFailure = new AtomicBoolean(false);
 
@@ -450,37 +450,28 @@ public class LlmJudgmentsProcessor implements BaseJudgmentsProcessor {
                             for (Map<String, Object> rating : ratings) {
                                 String compositeKey = (String) rating.get("id");
 
-                                // Try multiple possible field names for the rating score
-                                Double ratingScore = null;
-                                Object scoreValue = rating.get("rating_score");
-                                if (scoreValue == null) {
-                                    scoreValue = rating.get("rating");
-                                }
-                                if (scoreValue == null) {
-                                    scoreValue = rating.get("score");
-                                }
-                                if (scoreValue == null) {
-                                    scoreValue = rating.get("relevance_score");
-                                }
-                                if (scoreValue == null) {
-                                    scoreValue = rating.get("relevance");
-                                }
+                                RatingFieldExtractor.ExtractionResult extractionResult = RatingFieldExtractor.extractRatingScore(rating);
 
-                                if (scoreValue != null && scoreValue instanceof Number) {
-                                    ratingScore = ((Number) scoreValue).doubleValue();
+                                if (extractionResult.isSuccess()) {
+                                    String docId = getDocIdFromCompositeKey(compositeKey);
+                                    String ratingScoreStr = extractionResult.getRatingScore().toString();
+                                    processedRatings.put(docId, ratingScoreStr);
+                                    updateJudgmentCache(compositeKey, queryTextWithReference, contextFields, ratingScoreStr, modelId);
+
+                                    log.debug(
+                                        "Successfully extracted rating {} from field '{}' for composite key: {}",
+                                        extractionResult.getRatingScore(),
+                                        extractionResult.getFieldUsed(),
+                                        compositeKey
+                                    );
                                 } else {
                                     log.warn(
-                                        "No valid rating score found for composite key: {}. Available fields: {}",
+                                        "Failed to extract rating score for composite key: {}. Available fields: {}. Reason: {}",
                                         compositeKey,
-                                        rating.keySet()
+                                        rating.keySet(),
+                                        extractionResult.getErrorMessage()
                                     );
-                                    // Skip this rating if no valid score found
-                                    continue;
                                 }
-
-                                String docId = getDocIdFromCompositeKey(compositeKey);
-                                processedRatings.put(docId, ratingScore.toString());
-                                updateJudgmentCache(compositeKey, queryTextWithReference, contextFields, ratingScore.toString(), modelId);
                             }
                         }
 
