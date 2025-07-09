@@ -44,9 +44,9 @@ jobs:
           sleep 2
         done
 
-        # Pull a lightweight model (phi3:mini is good balance of size/quality)
-        echo "Pulling Phi-3 mini model..."
-        ollama pull phi3:mini
+        # Pull the smallest available model for CI (tinyllama is fastest)
+        echo "Pulling TinyLlama model (optimized for CI)..."
+        ollama pull tinyllama
 
         # Verify model is available
         echo "Available models:"
@@ -64,7 +64,7 @@ jobs:
         curl -s -X POST http://localhost:11434/api/chat \
           -H "Content-Type: application/json" \
           -d '{
-            "model": "phi3:mini",
+            "model": "tinyllama",
             "messages": [{"role": "user", "content": "Hello! Are you working?"}],
             "stream": false
           }' | jq .
@@ -90,7 +90,7 @@ jobs:
                         response = {
                             "data": [
                                 {
-                                    "id": "phi3:mini",
+                                    "id": "tinyllama",
                                     "object": "model",
                                     "created": int(datetime.now().timestamp()),
                                     "owned_by": "ollama"
@@ -114,20 +114,20 @@ jobs:
                         self.send_response(400)
                         self.end_headers()
                         return
-                        
+
                     post_data = self.rfile.read(content_length)
                     request_data = json.loads(post_data.decode('utf-8'))
-                    
+
                     print(f"Received request: {json.dumps(request_data, indent=2)}")
 
                     if self.path == '/v1/chat/completions':
                         # Convert OpenAI format to Ollama format
                         ollama_request = {
-                            "model": "phi3:mini",
+                            "model": "tinyllama",
                             "messages": request_data.get("messages", []),
                             "stream": False
                         }
-                        
+
                         print(f"Sending to Ollama: {json.dumps(ollama_request, indent=2)}")
 
                         # Call Ollama API with longer timeout
@@ -136,20 +136,20 @@ jobs:
                             json=ollama_request,
                             timeout=60
                         )
-                        
+
                         print(f"Ollama status: {ollama_response.status_code}")
                         print(f"Ollama response: {ollama_response.text}")
 
                         if ollama_response.status_code == 200:
                             ollama_data = ollama_response.json()
                             content = ollama_data.get("message", {}).get("content", "")
-                            
+
                             # Convert Ollama response to OpenAI format
                             openai_response = {
                                 "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
-                                "object": "chat.completion", 
+                                "object": "chat.completion",
                                 "created": int(datetime.now().timestamp()),
-                                "model": "phi3:mini",
+                                "model": "tinyllama",
                                 "choices": [
                                     {
                                         "index": 0,
@@ -166,7 +166,7 @@ jobs:
                                     "total_tokens": 100 + len(content.split())
                                 }
                             }
-                            
+
                             print(f"Sending OpenAI response: {json.dumps(openai_response, indent=2)}")
 
                             self.send_response(200)
@@ -183,7 +183,7 @@ jobs:
                     else:
                         self.send_response(404)
                         self.end_headers()
-                        
+
                 except Exception as e:
                     print(f"POST Error: {e}")
                     traceback.print_exc()
@@ -217,7 +217,7 @@ jobs:
         # Test the bridge
         echo "Testing Ollama bridge..."
         curl -v http://localhost:8080/v1/models | jq . || echo "Bridge test failed"
-        
+
         # Show bridge logs
         echo "Bridge logs:"
         tail -n 20 bridge.log || echo "No bridge logs yet"
@@ -225,7 +225,7 @@ jobs:
     - name: Run integration tests with Ollama
       env:
         LOCALAI_API_URL: http://localhost:8080
-        LLM_MODEL_NAME: phi3:mini
+        LLM_MODEL_NAME: tinyllama
       run: |
         ./gradlew integTest --tests "*LLMJudgmentGenerationIT" -Dtests.cluster.llm.enabled=true
 

@@ -20,6 +20,13 @@ get_model_info() {
     local field="$2"
     
     case "$model" in
+        "tinyllama")
+            case "$field" in
+                "name") echo "tinyllama" ;;
+                "size") echo "~637MB" ;;
+                "desc") echo "TinyLlama 1.1B - ⚡ Ultra-fast for CI/testing" ;;
+            esac
+            ;;
         "phi3:mini")
             case "$field" in
                 "name") echo "phi3:mini" ;;
@@ -66,6 +73,7 @@ if ! get_model_info "$MODEL_CHOICE" "name" >/dev/null 2>&1; then
     echo "❌ Unknown model: $MODEL_CHOICE"
     echo ""
     echo "Available models:"
+    echo "  tinyllama    - TinyLlama 1.1B (~637MB) - ⚡ Ultra-fast for CI/testing"
     echo "  phi3:mini    - Microsoft Phi-3 Mini (~2.3GB) - ⭐ Recommended balance"
     echo "  llama3.2:3b - Llama 3.2 3B (~2.0GB) - ✅ Good for low RAM"
     echo "  qwen2.5:7b  - Qwen2.5 7B (~4.1GB) - 🧠 Excellent reasoning"
@@ -94,14 +102,14 @@ cd "$OLLAMA_DIR"
 if ! command -v ollama &> /dev/null; then
     echo "Installing Ollama..."
     curl -fsSL https://ollama.com/install.sh | sh
-    echo "✅ Ollama installed successfully"
+    echo "Ollama installed successfully"
 else
-    echo "✅ Ollama already installed"
+    echo "Ollama already installed"
 fi
 
 # Check if Ollama service is already running
 if curl -s http://localhost:11434/api/version > /dev/null 2>&1; then
-    echo "✅ Ollama service already running"
+    echo "Ollama service already running"
 else
     echo "Starting Ollama service..."
     ollama serve &
@@ -112,11 +120,11 @@ else
     echo "Waiting for Ollama to start..."
     for i in {1..30}; do
         if curl -s http://localhost:11434/api/version > /dev/null 2>&1; then
-            echo "✅ Ollama service started successfully"
+            echo "Ollama service started successfully"
             break
         fi
         if [ $i -eq 30 ]; then
-            echo "❌ Ollama failed to start within 1 minute"
+            echo "Ollama failed to start within 1 minute"
             exit 1
         fi
         echo "  Attempt $i/30: Still waiting..."
@@ -126,12 +134,12 @@ fi
 
 # Check if model is already available
 if ollama list | grep -q "$MODEL_NAME"; then
-    echo "✅ Model $MODEL_NAME already available"
+    echo "Model $MODEL_NAME already available"
 else
     echo "Pulling model $MODEL_NAME ($MODEL_SIZE)..."
     echo "This may take several minutes depending on your internet connection..."
     ollama pull "$MODEL_NAME"
-    echo "✅ Model $MODEL_NAME pulled successfully"
+    echo "Model $MODEL_NAME pulled successfully"
 fi
 
 # Verify model is available
@@ -153,7 +161,7 @@ curl -s -X POST http://localhost:11434/api/chat \
 # Create Ollama bridge (same as GitHub Actions)
 echo ""
 echo "Creating Ollama bridge for OpenAI compatibility..."
-cat > "$OLLAMA_DIR/ollama_bridge.py" <<'EOF'
+cat > "$OLLAMA_DIR/ollama_bridge.py" <<EOF
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
 import requests
@@ -170,7 +178,7 @@ class OllamaHandler(BaseHTTPRequestHandler):
             response = {
                 "data": [
                     {
-                        "id": "phi3:mini",
+                        "id": "$MODEL_NAME",
                         "object": "model",
                         "created": int(datetime.now().timestamp()),
                         "owned_by": "ollama"
@@ -191,7 +199,7 @@ class OllamaHandler(BaseHTTPRequestHandler):
             try:
                 # Convert OpenAI format to Ollama format
                 ollama_request = {
-                    "model": "phi3:mini",
+                    "model": "$MODEL_NAME",
                     "messages": request_data.get("messages", []),
                     "stream": False
                 }
@@ -211,7 +219,7 @@ class OllamaHandler(BaseHTTPRequestHandler):
                         "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
                         "object": "chat.completion",
                         "created": int(datetime.now().timestamp()),
-                        "model": "phi3:mini",
+                        "model": "$MODEL_NAME",
                         "choices": [
                             {
                                 "index": 0,
@@ -268,9 +276,9 @@ else
     # Test the bridge
     echo "Testing Ollama bridge..."
     if curl -s http://localhost:8080/v1/models > /dev/null 2>&1; then
-        echo "✅ Ollama bridge started successfully"
+        echo "Ollama bridge started successfully"
     else
-        echo "❌ Failed to start Ollama bridge"
+        echo "Failed to start Ollama bridge"
         exit 1
     fi
 fi
