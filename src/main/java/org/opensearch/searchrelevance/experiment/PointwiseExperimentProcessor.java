@@ -11,14 +11,22 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Queue;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 import org.opensearch.action.search.SearchResponse;
+import org.opensearch.common.cache.Cache;
+import org.opensearch.common.cache.CacheBuilder;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.searchrelevance.dao.JudgmentDao;
 import org.opensearch.searchrelevance.executors.ExperimentTaskManager;
@@ -27,21 +35,34 @@ import org.opensearch.searchrelevance.model.ExperimentType;
 import org.opensearch.searchrelevance.model.ExperimentVariant;
 import org.opensearch.searchrelevance.utils.TimeUtils;
 
-import lombok.AllArgsConstructor;
 import lombok.extern.log4j.Log4j2;
 
 /**
  * Processor for handling POINTWISE_EVALUATION experiments with task scheduling
  */
 @Log4j2
-@AllArgsConstructor
 public class PointwiseExperimentProcessor {
 
     private final JudgmentDao judgmentDao;
     private final ExperimentTaskManager taskManager;
 
-    // Simple cache for judgments per experiment
-    private final Map<String, Map<String, String>> judgmentCache = new ConcurrentHashMap<>();
+    // Use OpenSearch's built-in cache implementation with bounded size
+    private final Cache<String, Map<String, String>> judgmentCache;
+
+    // Configuration constants
+    private static final long CACHE_SIZE = 100_000;
+    private static final TimeValue CACHE_EXPIRE_TIME = TimeValue.timeValueHours(1);
+
+    public PointwiseExperimentProcessor(JudgmentDao judgmentDao, ExperimentTaskManager taskManager) {
+        this.judgmentDao = judgmentDao;
+        this.taskManager = taskManager;
+
+        // Initialize cache with size limit and TTL
+        this.judgmentCache = CacheBuilder.<String, Map<String, String>>builder()
+            .setMaximumWeight(CACHE_SIZE)
+            .setExpireAfterAccess(CACHE_EXPIRE_TIME)
+            .build();
+    }
 
     /**
      * Process pointwise evaluation experiment with simple optimizations
@@ -87,11 +108,14 @@ public class PointwiseExperimentProcessor {
      * Load and cache judgments for the experiment
      */
     private CompletableFuture<Map<String, String>> loadJudgmentsAsync(String experimentId, List<String> judgmentList, String queryText) {
-        // Check cache first
         String cacheKey = experimentId + ":" + queryText;
-        if (judgmentCache.containsKey(cacheKey)) {
-            return CompletableFuture.completedFuture(judgmentCache.get(cacheKey));
+        Map<String, String> cached = judgmentCache.get(cacheKey);
+        if (Objects.nonNull(cached)) {
+            return CompletableFuture.completedFuture(cached);
         }
+
+        AtomicInteger failureCount = new AtomicInteger(0);
+        int failureThreshold = Math.min(5, judgmentList.size());
 
         // Load judgments in parallel
         List<CompletableFuture<SearchResponse>> judgmentFutures = judgmentList.stream().map(judgmentId -> {
@@ -109,10 +133,20 @@ public class PointwiseExperimentProcessor {
                     extractJudgmentScores(queryText, response, docIdToScores);
                 } catch (Exception e) {
                     log.error("Failed to process judgment response: {}", e.getMessage());
+                    if (failureCount.incrementAndGet() >= failureThreshold) {
+                        throw new RuntimeException(
+                            String.format(
+                                Locale.ROOT,
+                                "Failed to load judgments: exceeded failure threshold %d/%d",
+                                failureCount.get(),
+                                failureThreshold
+                            ),
+                            e
+                        );
+                    }
                 }
             }
 
-            // Cache results
             judgmentCache.put(cacheKey, docIdToScores);
             return docIdToScores;
         });
@@ -122,7 +156,7 @@ public class PointwiseExperimentProcessor {
      * Extract judgment scores from SearchResponse
      */
     private void extractJudgmentScores(String queryText, SearchResponse response, Map<String, String> docIdToScores) {
-        if (response.getHits().getTotalHits().value() == 0) {
+        if (Objects.isNull(response.getHits()) || response.getHits().getTotalHits().value() == 0) {
             return;
         }
 
@@ -135,7 +169,7 @@ public class PointwiseExperimentProcessor {
         for (Map<String, Object> rating : judgmentRatings) {
             if (queryText.equals(rating.get("query"))) {
                 List<Map<String, String>> docScoreRatings = (List<Map<String, String>>) rating.get("ratings");
-                if (docScoreRatings != null) {
+                if (Objects.nonNull(docScoreRatings)) {
                     docScoreRatings.forEach(docScoreRating -> docIdToScores.put(docScoreRating.get("docId"), docScoreRating.get("rating")));
                 }
                 break;
@@ -161,7 +195,8 @@ public class PointwiseExperimentProcessor {
 
         // Process configurations in parallel
         Map<String, Object> configToExperimentVariants = new ConcurrentHashMap<>();
-        List<Map<String, Object>> allResults = Collections.synchronizedList(new ArrayList<>());
+        // Use ConcurrentLinkedQueue for lock-free additions
+        Queue<Map<String, Object>> allResults = new ConcurrentLinkedQueue<>();
 
         List<CompletableFuture<Void>> configFutures = indexAndQueries.entrySet().stream().map(entry -> {
             String searchConfigId = entry.getKey();
@@ -193,7 +228,7 @@ public class PointwiseExperimentProcessor {
             return configFuture.thenAccept(results -> {
                 List<Map<String, Object>> configEvaluationResults = (List<Map<String, Object>>) results.get("evaluationResults");
 
-                if (configEvaluationResults != null && !configEvaluationResults.isEmpty()) {
+                if (Objects.nonNull(configEvaluationResults) && !configEvaluationResults.isEmpty()) {
                     for (Map<String, Object> evalResult : configEvaluationResults) {
                         Map<String, Object> result = new HashMap<>();
                         result.put("evaluationId", evalResult.get("evaluationId"));

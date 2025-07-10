@@ -19,6 +19,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.junit.Before;
@@ -54,6 +56,7 @@ public class PointwiseExperimentProcessorTests extends OpenSearchTestCase {
         processor = new PointwiseExperimentProcessor(judgmentDao, taskManager);
     }
 
+    @SneakyThrows
     public void testProcessPointwiseExperiment_Success() {
         // Setup test data
         String experimentId = "test-experiment-id";
@@ -64,10 +67,11 @@ public class PointwiseExperimentProcessorTests extends OpenSearchTestCase {
         int size = 10;
         AtomicBoolean hasFailure = new AtomicBoolean(false);
 
-        // Mock successful judgment response with empty response (we just want to test the flow)
+        // Mock successful judgment response with actual judgment data
         doAnswer(invocation -> {
             ActionListener<SearchResponse> listener = invocation.getArgument(1);
             SearchResponse mockResponse = mock(SearchResponse.class);
+            when(mockResponse.getHits()).thenReturn(null);
             listener.onResponse(mockResponse);
             return null;
         }).when(judgmentDao).getJudgment(anyString(), any(ActionListener.class));
@@ -93,17 +97,34 @@ public class PointwiseExperimentProcessorTests extends OpenSearchTestCase {
             )
         ).thenReturn(mockFuture);
 
-        // Mock ActionListener
-        ActionListener<Map<String, Object>> listener = mock(ActionListener.class);
+        // Mock ActionListener with CountDownLatch to wait for completion
+        CountDownLatch latch = new CountDownLatch(1);
+        ActionListener<Map<String, Object>> listener = new ActionListener<Map<String, Object>>() {
+            @Override
+            public void onResponse(Map<String, Object> response) {
+                assertNotNull(response);
+                assertTrue(response.containsKey("results"));
+                latch.countDown();
+            }
+
+            @Override
+            public void onFailure(Exception e) {
+                fail("Should not have failed: " + e.getMessage());
+                latch.countDown();
+            }
+        };
 
         // Execute
         processor.processPointwiseExperiment(experimentId, queryText, indexAndQueries, judgmentList, size, hasFailure, listener);
 
+        // Wait for async operation to complete
+        assertTrue("Async operation should complete within timeout", latch.await(5, TimeUnit.SECONDS));
+
         // Verify interactions
         verify(judgmentDao).getJudgment(anyString(), any(ActionListener.class));
-        verify(listener).onResponse(any(Map.class));
     }
 
+    @SneakyThrows
     public void testProcessPointwiseExperiment_JudgmentFailure() {
         // Setup test data
         String experimentId = "test-experiment-id";
@@ -121,14 +142,27 @@ public class PointwiseExperimentProcessorTests extends OpenSearchTestCase {
             return null;
         }).when(judgmentDao).getJudgment(anyString(), any(ActionListener.class));
 
-        // Mock ActionListener
-        ActionListener<Map<String, Object>> listener = mock(ActionListener.class);
+        // Mock ActionListener with CountDownLatch to wait for completion
+        CountDownLatch latch = new CountDownLatch(1);
+        ActionListener<Map<String, Object>> listener = new ActionListener<Map<String, Object>>() {
+            @Override
+            public void onResponse(Map<String, Object> response) {
+                fail("Should have failed, but got response");
+                latch.countDown();
+            }
+
+            @Override
+            public void onFailure(Exception e) {
+                assertNotNull(e);
+                latch.countDown();
+            }
+        };
 
         // Execute
         processor.processPointwiseExperiment(experimentId, queryText, indexAndQueries, judgmentList, size, hasFailure, listener);
 
-        // Verify failure handling
-        verify(listener).onFailure(any(Exception.class));
+        // Wait for async operation to complete
+        assertTrue("Async operation should complete within timeout", latch.await(5, TimeUnit.SECONDS));
     }
 
     public void testCreatePointwiseVariants() {
