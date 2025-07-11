@@ -36,9 +36,9 @@ import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
 
 /**
- * Unit tests for HybridSearchTaskManager
+ * Unit tests for ExperimentTaskManager
  */
-public class HybridSearchTaskManagerTests extends OpenSearchTestCase {
+public class ExperimentTaskManagerTests extends OpenSearchTestCase {
 
     private Client client;
     private ClusterService clusterService;
@@ -162,8 +162,8 @@ public class HybridSearchTaskManagerTests extends OpenSearchTestCase {
     // Tests for newly added dynamic concurrency control logic
 
     public void testDynamicConcurrencyControlInitialization() {
-        // Test that HybridSearchTaskManager initializes with dynamic concurrency limits
-        HybridSearchTaskManager taskManager = new HybridSearchTaskManager(client, evaluationResultDao, experimentVariantDao, threadPool);
+        // Test that ExperimentTaskManager initializes with dynamic concurrency limits
+        ExperimentTaskManager taskManager = new ExperimentTaskManager(client, evaluationResultDao, experimentVariantDao, threadPool);
 
         Map<String, Object> metrics = taskManager.getConcurrencyMetrics();
 
@@ -189,7 +189,7 @@ public class HybridSearchTaskManagerTests extends OpenSearchTestCase {
 
     public void testConcurrencyLimitCalculationLogic() {
         // Test the actual concurrency calculation logic with current system
-        HybridSearchTaskManager taskManager = new HybridSearchTaskManager(client, evaluationResultDao, experimentVariantDao, threadPool);
+        ExperimentTaskManager taskManager = new ExperimentTaskManager(client, evaluationResultDao, experimentVariantDao, threadPool);
 
         Map<String, Object> metrics = taskManager.getConcurrencyMetrics();
         int maxConcurrentTasks = (Integer) metrics.get("max_concurrent_tasks");
@@ -203,7 +203,7 @@ public class HybridSearchTaskManagerTests extends OpenSearchTestCase {
 
     public void testConcurrencyMetricsConsistency() {
         // Test that metrics are consistent and make sense
-        HybridSearchTaskManager taskManager = new HybridSearchTaskManager(client, evaluationResultDao, experimentVariantDao, threadPool);
+        ExperimentTaskManager taskManager = new ExperimentTaskManager(client, evaluationResultDao, experimentVariantDao, threadPool);
 
         Map<String, Object> metrics = taskManager.getConcurrencyMetrics();
 
@@ -224,7 +224,7 @@ public class HybridSearchTaskManagerTests extends OpenSearchTestCase {
 
     public void testConcurrencyLimitBoundaries() {
         // Test that the concurrency calculation respects minimum and maximum bounds
-        HybridSearchTaskManager taskManager = new HybridSearchTaskManager(client, evaluationResultDao, experimentVariantDao, threadPool);
+        ExperimentTaskManager taskManager = new ExperimentTaskManager(client, evaluationResultDao, experimentVariantDao, threadPool);
 
         Map<String, Object> metrics = taskManager.getConcurrencyMetrics();
         int maxConcurrentTasks = (Integer) metrics.get("max_concurrent_tasks");
@@ -245,7 +245,7 @@ public class HybridSearchTaskManagerTests extends OpenSearchTestCase {
 
     public void testDynamicConcurrencyScaling() {
         // Test that dynamic concurrency scales appropriately with processor count
-        HybridSearchTaskManager taskManager = new HybridSearchTaskManager(client, evaluationResultDao, experimentVariantDao, threadPool);
+        ExperimentTaskManager taskManager = new ExperimentTaskManager(client, evaluationResultDao, experimentVariantDao, threadPool);
 
         Map<String, Object> metrics = taskManager.getConcurrencyMetrics();
         int maxConcurrentTasks = (Integer) metrics.get("max_concurrent_tasks");
@@ -267,7 +267,7 @@ public class HybridSearchTaskManagerTests extends OpenSearchTestCase {
 
     public void testConfigMapInitialization() throws Exception {
         // Arrange
-        HybridSearchTaskManager taskManager = new HybridSearchTaskManager(client, evaluationResultDao, experimentVariantDao, threadPool);
+        ExperimentTaskManager taskManager = new ExperimentTaskManager(client, evaluationResultDao, experimentVariantDao, threadPool);
         String experimentId = "test-experiment";
         String searchConfigId = "test-config";
         Map<String, Object> initialConfigMap = new HashMap<>();
@@ -275,6 +275,7 @@ public class HybridSearchTaskManagerTests extends OpenSearchTestCase {
 
         // Act
         CompletableFuture<Map<String, Object>> future = taskManager.scheduleTasksAsync(
+            ExperimentType.HYBRID_OPTIMIZER,
             experimentId,
             searchConfigId,
             "test-index",

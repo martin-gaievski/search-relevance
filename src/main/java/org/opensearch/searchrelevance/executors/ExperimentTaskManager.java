@@ -31,6 +31,7 @@ import org.opensearch.core.common.breaker.CircuitBreakingException;
 import org.opensearch.searchrelevance.dao.EvaluationResultDao;
 import org.opensearch.searchrelevance.dao.ExperimentVariantDao;
 import org.opensearch.searchrelevance.experiment.QuerySourceUtil;
+import org.opensearch.searchrelevance.model.ExperimentType;
 import org.opensearch.searchrelevance.model.ExperimentVariant;
 import org.opensearch.searchrelevance.model.builder.SearchRequestBuilder;
 import org.opensearch.threadpool.ThreadPool;
@@ -41,10 +42,11 @@ import com.google.common.annotations.VisibleForTesting;
 import lombok.extern.log4j.Log4j2;
 
 /**
- * Class for managing tasks related to hybrid search
+ * Generic task manager for scheduling experiment tasks with concurrency control and backpressure handling.
+ * Supports HYBRID_OPTIMIZER and POINTWISE_EVALUATION experiment types.
  */
 @Log4j2
-public class HybridSearchTaskManager {
+public class ExperimentTaskManager {
     public static final int TASK_RETRY_DELAY_MILLISECONDS = 1000;
     public static final int ALLOCATED_PROCESSORS = OpenSearchExecutors.allocatedProcessors(Settings.EMPTY);
 
@@ -67,7 +69,7 @@ public class HybridSearchTaskManager {
     private final SearchResponseProcessor searchResponseProcessor;
 
     @Inject
-    public HybridSearchTaskManager(
+    public ExperimentTaskManager(
         Client client,
         EvaluationResultDao evaluationResultDao,
         ExperimentVariantDao experimentVariantDao,
@@ -83,16 +85,17 @@ public class HybridSearchTaskManager {
         this.concurrencyControl = new Semaphore(maxConcurrentTasks, true);
 
         log.info(
-            "HybridSearchTaskManagerOptimized initialized with max {} concurrent tasks (processors: {})",
+            "ExperimentTaskManager initialized with max {} concurrent tasks (processors: {})",
             maxConcurrentTasks,
             ALLOCATED_PROCESSORS
         );
     }
 
     /**
-     * Schedule hybrid search tasks using non-blocking mechanisms
+     * Schedule experiment tasks using non-blocking mechanisms
      */
     public CompletableFuture<Map<String, Object>> scheduleTasksAsync(
+        ExperimentType experimentType,
         String experimentId,
         String searchConfigId,
         String index,
@@ -117,7 +120,8 @@ public class HybridSearchTaskManager {
             new ConcurrentHashMap<>(configToExperimentVariants),
             resultFuture,
             hasFailure,
-            experimentVariantDao
+            experimentVariantDao,
+            experimentType
         );
 
         // Use putIfAbsent for atomic operation
@@ -127,25 +131,27 @@ public class HybridSearchTaskManager {
         taskContext.getConfigToExperimentVariants().computeIfAbsent(searchConfigId, k -> new ConcurrentHashMap<String, Object>());
 
         log.info(
-            "Scheduling {} hybrid search tasks for experiment {} with non-blocking concurrency",
+            "Scheduling {} {} experiment tasks for experiment {} with non-blocking concurrency",
             experimentVariants.size(),
+            experimentType,
             experimentId
         );
 
         // Schedule tasks asynchronously
         List<CompletableFuture<Void>> variantFutures = experimentVariants.stream().map(variant -> {
-            VariantTaskParameters params = VariantTaskParameters.builder()
-                .experimentId(experimentId)
-                .searchConfigId(searchConfigId)
-                .index(index)
-                .query(query)
-                .queryText(queryText)
-                .size(size)
-                .experimentVariant(variant)
-                .judgmentIds(judgmentIds)
-                .docIdToScores(docIdToScores)
-                .taskContext(taskContext)
-                .build();
+            VariantTaskParameters params = createTaskParameters(
+                experimentType,
+                experimentId,
+                searchConfigId,
+                index,
+                query,
+                queryText,
+                size,
+                variant,
+                judgmentIds,
+                docIdToScores,
+                taskContext
+            );
 
             return scheduleVariantTaskAsync(params);
         }).toList();
@@ -157,6 +163,60 @@ public class HybridSearchTaskManager {
         });
 
         return resultFuture;
+    }
+
+    /**
+     * Create task parameters based on experiment type
+     */
+    private VariantTaskParameters createTaskParameters(
+        ExperimentType experimentType,
+        String experimentId,
+        String searchConfigId,
+        String index,
+        String query,
+        String queryText,
+        int size,
+        ExperimentVariant variant,
+        List<String> judgmentIds,
+        Map<String, String> docIdToScores,
+        ExperimentTaskContext taskContext
+    ) {
+        if (experimentType == ExperimentType.POINTWISE_EVALUATION) {
+            return PointwiseTaskParameters.builder()
+                .experimentId(experimentId)
+                .searchConfigId(searchConfigId)
+                .index(index)
+                .query(query)
+                .queryText(queryText)
+                .size(size)
+                .experimentVariant(variant)
+                .judgmentIds(judgmentIds)
+                .docIdToScores(docIdToScores)
+                .taskContext(taskContext)
+                .searchPipeline(getSearchPipelineFromVariant(variant))
+                .build();
+        } else {
+            // Default to hybrid optimizer parameters
+            return VariantTaskParameters.builder()
+                .experimentId(experimentId)
+                .searchConfigId(searchConfigId)
+                .index(index)
+                .query(query)
+                .queryText(queryText)
+                .size(size)
+                .experimentVariant(variant)
+                .judgmentIds(judgmentIds)
+                .docIdToScores(docIdToScores)
+                .taskContext(taskContext)
+                .build();
+        }
+    }
+
+    /**
+     * Extract search pipeline from variant parameters for pointwise experiments
+     */
+    private String getSearchPipelineFromVariant(ExperimentVariant variant) {
+        return (String) variant.getParameters().get("searchPipeline");
     }
 
     /**
@@ -223,17 +283,7 @@ public class HybridSearchTaskManager {
         }
 
         final String evaluationId = UUID.randomUUID().toString();
-        Map<String, Object> temporarySearchPipeline = QuerySourceUtil.createDefinitionOfTemporarySearchPipeline(
-            params.getExperimentVariant()
-        );
-
-        SearchRequest searchRequest = SearchRequestBuilder.buildRequestForHybridSearch(
-            params.getIndex(),
-            params.getQuery(),
-            temporarySearchPipeline,
-            params.getQueryText(),
-            params.getSize()
-        );
+        SearchRequest searchRequest = buildSearchRequest(params, evaluationId);
 
         // Convert ActionListener to CompletableFuture
         CompletableFuture<Void> searchFuture = new CompletableFuture<>();
@@ -285,6 +335,34 @@ public class HybridSearchTaskManager {
                 future.complete(null);
             }
         });
+    }
+
+    /**
+     * Build search request based on experiment type
+     */
+    private SearchRequest buildSearchRequest(VariantTaskParameters params, String evaluationId) {
+        if (params instanceof PointwiseTaskParameters) {
+            PointwiseTaskParameters pointwiseParams = (PointwiseTaskParameters) params;
+            return SearchRequestBuilder.buildSearchRequest(
+                pointwiseParams.getIndex(),
+                pointwiseParams.getQuery(),
+                pointwiseParams.getQueryText(),
+                pointwiseParams.getSearchPipeline(),
+                pointwiseParams.getSize()
+            );
+        } else {
+            Map<String, Object> temporarySearchPipeline = QuerySourceUtil.createDefinitionOfTemporarySearchPipeline(
+                params.getExperimentVariant()
+            );
+
+            return SearchRequestBuilder.buildRequestForHybridSearch(
+                params.getIndex(),
+                params.getQuery(),
+                temporarySearchPipeline,
+                params.getQueryText(),
+                params.getSize()
+            );
+        }
     }
 
     private void handleSearchFailure(

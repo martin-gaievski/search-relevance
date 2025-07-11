@@ -7,7 +7,7 @@
  */
 package org.opensearch.searchrelevance.transport.experiment;
 
-import static org.opensearch.searchrelevance.common.MetricsConstants.PAIRWISE_FIELD_NAME_QUERY_TEXT;
+import static org.opensearch.searchrelevance.common.MetricsConstants.QUERY_TEXT;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -20,8 +20,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 import org.opensearch.action.index.IndexResponse;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.support.ActionFilters;
@@ -34,8 +32,9 @@ import org.opensearch.searchrelevance.dao.JudgmentDao;
 import org.opensearch.searchrelevance.dao.QuerySetDao;
 import org.opensearch.searchrelevance.dao.SearchConfigurationDao;
 import org.opensearch.searchrelevance.exception.SearchRelevanceException;
-import org.opensearch.searchrelevance.executors.HybridSearchTaskManager;
+import org.opensearch.searchrelevance.executors.ExperimentTaskManager;
 import org.opensearch.searchrelevance.experiment.HybridOptimizerExperimentProcessor;
+import org.opensearch.searchrelevance.experiment.PointwiseExperimentProcessor;
 import org.opensearch.searchrelevance.metrics.MetricsHelper;
 import org.opensearch.searchrelevance.model.AsyncStatus;
 import org.opensearch.searchrelevance.model.Experiment;
@@ -46,9 +45,12 @@ import org.opensearch.searchrelevance.utils.TimeUtils;
 import org.opensearch.tasks.Task;
 import org.opensearch.transport.TransportService;
 
+import lombok.extern.log4j.Log4j2;
+
 /**
  * Handles transport actions for creating experiments in the system.
  */
+@Log4j2
 public class PutExperimentTransportAction extends HandledTransportAction<PutExperimentRequest, IndexResponse> {
 
     private final ExperimentDao experimentDao;
@@ -56,8 +58,7 @@ public class PutExperimentTransportAction extends HandledTransportAction<PutExpe
     private final SearchConfigurationDao searchConfigurationDao;
     private final MetricsHelper metricsHelper;
     private final HybridOptimizerExperimentProcessor hybridOptimizerExperimentProcessor;
-
-    private static final Logger LOGGER = LogManager.getLogger(PutExperimentTransportAction.class);
+    private final PointwiseExperimentProcessor pointwiseExperimentProcessor;
 
     @Inject
     public PutExperimentTransportAction(
@@ -68,14 +69,15 @@ public class PutExperimentTransportAction extends HandledTransportAction<PutExpe
         SearchConfigurationDao searchConfigurationDao,
         MetricsHelper metricsHelper,
         JudgmentDao judgmentDao,
-        HybridSearchTaskManager hybridSearchTaskManager
+        ExperimentTaskManager experimentTaskManager
     ) {
         super(PutExperimentAction.NAME, transportService, actionFilters, PutExperimentRequest::new);
         this.experimentDao = experimentDao;
         this.querySetDao = querySetDao;
         this.searchConfigurationDao = searchConfigurationDao;
         this.metricsHelper = metricsHelper;
-        this.hybridOptimizerExperimentProcessor = new HybridOptimizerExperimentProcessor(judgmentDao, hybridSearchTaskManager);
+        this.hybridOptimizerExperimentProcessor = new HybridOptimizerExperimentProcessor(judgmentDao, experimentTaskManager);
+        this.pointwiseExperimentProcessor = new PointwiseExperimentProcessor(judgmentDao, experimentTaskManager);
     }
 
     @Override
@@ -107,14 +109,14 @@ public class PutExperimentTransportAction extends HandledTransportAction<PutExpe
                 // Start async processing
                 triggerAsyncProcessing(id, request);
             }, e -> {
-                LOGGER.error("Failed to create initial experiment", e);
+                log.error("Failed to create initial experiment", e);
                 listener.onFailure(
                     new SearchRelevanceException("Failed to create initial experiment", e, RestStatus.INTERNAL_SERVER_ERROR)
                 );
             }));
 
         } catch (Exception e) {
-            LOGGER.error("Failed to process experiment request", e);
+            log.error("Failed to process experiment request", e);
             listener.onFailure(new SearchRelevanceException("Failed to process experiment request", e, RestStatus.INTERNAL_SERVER_ERROR));
         }
     }
@@ -309,25 +311,26 @@ public class PutExperimentTransportAction extends HandledTransportAction<PutExpe
                     )
                 );
             } else if (request.getType() == ExperimentType.POINTWISE_EVALUATION) {
-                metricsHelper.processEvaluationMetrics(
+                pointwiseExperimentProcessor.processPointwiseExperiment(
+                    experimentId,
                     queryText,
                     indexAndQueries,
-                    request.getSize(),
                     judgmentList,
-                    ActionListener.wrap(queryResults -> {
-                        Map<String, Object> convertedResults = new HashMap<>(queryResults);
-                        handleQueryResults(
+                    request.getSize(),
+                    hasFailure,
+                    ActionListener.wrap(
+                        queryResults -> handleQueryResults(
                             queryText,
-                            convertedResults,
+                            queryResults,
                             finalResults,
                             pendingQueries,
                             experimentId,
                             request,
                             hasFailure,
                             judgmentList
-                        );
-                    }, error -> handleFailure(error, hasFailure, experimentId, request)),
-                    Collections.emptyList()
+                        ),
+                        error -> handleFailure(error, hasFailure, experimentId, request)
+                    )
                 );
             } else {
                 throw new SearchRelevanceException("Unknown experimentType" + request.getType(), RestStatus.BAD_REQUEST);
@@ -358,13 +361,20 @@ public class PutExperimentTransportAction extends HandledTransportAction<PutExpe
                     if (searchConfigResults != null) {
                         for (Map<String, Object> configResult : searchConfigResults) {
                             Map<String, Object> resultWithQuery = new HashMap<>(configResult);
-                            resultWithQuery.put(PAIRWISE_FIELD_NAME_QUERY_TEXT, queryText);
+                            resultWithQuery.put(QUERY_TEXT, queryText);
                             finalResults.add(resultWithQuery);
                         }
                     }
+                } else if (request.getType() == ExperimentType.POINTWISE_EVALUATION) {
+                    // For POINTWISE_EVALUATION, the response contains results array
+                    List<Map<String, Object>> pointwiseResults = (List<Map<String, Object>>) queryResults.get("results");
+                    if (pointwiseResults != null) {
+                        // Results already contain the proper format with evaluationId, searchConfigurationId, queryText
+                        finalResults.addAll(pointwiseResults);
+                    }
                 } else {
-                    // For other experiment types, use the original format
-                    queryResults.put(PAIRWISE_FIELD_NAME_QUERY_TEXT, queryText);
+                    // For other experiment types, use generic format
+                    queryResults.put(QUERY_TEXT, queryText);
                     finalResults.add(queryResults);
                 }
 
@@ -404,14 +414,14 @@ public class PutExperimentTransportAction extends HandledTransportAction<PutExpe
         experimentDao.updateExperiment(
             finalExperiment,
             ActionListener.wrap(
-                response -> LOGGER.debug("Updated final experiment: {}", experimentId),
+                response -> log.debug("Updated final experiment: {}", experimentId),
                 error -> handleAsyncFailure(experimentId, request, "Failed to update final experiment", error)
             )
         );
     }
 
     private void handleAsyncFailure(String experimentId, PutExperimentRequest request, String message, Exception error) {
-        LOGGER.error(message + " for experiment: " + experimentId, error);
+        log.error(message + " for experiment: " + experimentId, error);
 
         Experiment errorExperiment = new Experiment(
             experimentId,
@@ -428,8 +438,8 @@ public class PutExperimentTransportAction extends HandledTransportAction<PutExpe
         experimentDao.updateExperiment(
             errorExperiment,
             ActionListener.wrap(
-                response -> LOGGER.info("Updated experiment {} status to ERROR", experimentId),
-                e -> LOGGER.error("Failed to update error status for experiment: " + experimentId, e)
+                response -> log.info("Updated experiment {} status to ERROR", experimentId),
+                e -> log.error("Failed to update error status for experiment: " + experimentId, e)
             )
         );
     }

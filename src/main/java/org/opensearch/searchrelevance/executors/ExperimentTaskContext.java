@@ -19,6 +19,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.searchrelevance.dao.ExperimentVariantDao;
 import org.opensearch.searchrelevance.model.ExperimentBatchStatus;
+import org.opensearch.searchrelevance.model.ExperimentType;
 import org.opensearch.searchrelevance.model.ExperimentVariant;
 
 import lombok.Getter;
@@ -38,6 +39,7 @@ public class ExperimentTaskContext {
     private final CompletableFuture<Map<String, Object>> resultFuture;
     private final AtomicBoolean hasFailure;
     private final ExperimentVariantDao experimentVariantDao;
+    private final ExperimentType experimentType;
 
     private final AtomicInteger remainingVariants;
     private final AtomicInteger successfulVariants;
@@ -51,7 +53,8 @@ public class ExperimentTaskContext {
         ConcurrentHashMap<String, Object> configToExperimentVariants,
         CompletableFuture<Map<String, Object>> resultFuture,
         AtomicBoolean hasFailure,
-        ExperimentVariantDao experimentVariantDao
+        ExperimentVariantDao experimentVariantDao,
+        ExperimentType experimentType
     ) {
         this.experimentId = experimentId;
         this.searchConfigId = searchConfigId;
@@ -61,6 +64,7 @@ public class ExperimentTaskContext {
         this.resultFuture = resultFuture;
         this.hasFailure = hasFailure;
         this.experimentVariantDao = experimentVariantDao;
+        this.experimentType = experimentType;
         this.remainingVariants = new AtomicInteger(totalVariants);
         this.successfulVariants = new AtomicInteger(0);
         this.failedVariants = new AtomicInteger(0);
@@ -72,17 +76,17 @@ public class ExperimentTaskContext {
      * Non-blocking variant write
      */
     public void scheduleVariantWrite(ExperimentVariant variant, String evaluationId, boolean isSuccess) {
+        // Store evaluationId immediately for successful variants before async write
+        if (isSuccess) {
+            ConcurrentHashMap<String, Object> map = (ConcurrentHashMap<String, Object>) configToExperimentVariants.get(searchConfigId);
+            if (map != null) {
+                map.put(variant.getId(), evaluationId);
+            }
+        }
+
         CompletableFuture.runAsync(() -> {
             experimentVariantDao.putExperimentVariantEfficient(variant, ActionListener.wrap(response -> {
                 log.debug("write successful for variant: {}", variant.getId());
-                if (isSuccess) {
-                    ConcurrentHashMap<String, Object> map = (ConcurrentHashMap<String, Object>) configToExperimentVariants.get(
-                        searchConfigId
-                    );
-                    if (map != null) {
-                        map.put(variant.getId(), evaluationId);
-                    }
-                }
             }, error -> { log.error("write failed for variant {}: {}", variant.getId(), error.getMessage()); }));
         });
     }
@@ -159,21 +163,48 @@ public class ExperimentTaskContext {
     }
 
     /**
-     * Format evaluation results for the final response
+     * Format evaluation results for the final response based on experiment type
      */
     private List<Map<String, Object>> formatEvaluationResults() {
         List<Map<String, Object>> results = new ArrayList<>();
         ConcurrentHashMap<String, Object> configMap = (ConcurrentHashMap<String, Object>) configToExperimentVariants.get(searchConfigId);
 
-        if (configMap != null) {
-            configMap.forEach((variantId, evalId) -> {
+        if (experimentType == ExperimentType.POINTWISE_EVALUATION) {
+            // Pointwise format: individual entries with evaluationId, searchConfigurationId, queryText
+            if (configMap != null && !configMap.isEmpty()) {
+                configMap.forEach((variantId, evalId) -> {
+                    Map<String, Object> result = new HashMap<>();
+                    result.put("evaluationId", evalId);
+                    result.put("searchConfigurationId", searchConfigId);
+                    result.put("queryText", queryText);
+                    results.add(result);
+                });
+            } else {
+                // When no evaluations exist, add simple queryText entry
                 Map<String, Object> result = new HashMap<>();
-                result.put("evaluationId", evalId);
-                result.put("experimentVariantId", variantId);
+                result.put("queryText", queryText);
                 results.add(result);
-            });
+            }
+        } else if (experimentType == ExperimentType.HYBRID_OPTIMIZER) {
+            // Hybrid optimizer format: evaluationId and experimentVariantId
+            if (configMap != null) {
+                configMap.forEach((variantId, evalId) -> {
+                    Map<String, Object> result = new HashMap<>();
+                    result.put("evaluationId", evalId);
+                    result.put("experimentVariantId", variantId);
+                    results.add(result);
+                });
+            }
+        } else {
+            if (configMap != null && !configMap.isEmpty()) {
+                configMap.forEach((variantId, evalId) -> {
+                    Map<String, Object> result = new HashMap<>();
+                    result.put("evaluationId", evalId);
+                    result.put("experimentVariantId", variantId);
+                    results.add(result);
+                });
+            }
         }
-
         return results;
     }
 }

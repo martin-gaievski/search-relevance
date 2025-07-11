@@ -25,27 +25,24 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.searchrelevance.dao.JudgmentDao;
-import org.opensearch.searchrelevance.executors.HybridSearchTaskManager;
+import org.opensearch.searchrelevance.executors.ExperimentTaskManager;
 import org.opensearch.searchrelevance.model.AsyncStatus;
 import org.opensearch.searchrelevance.model.ExperimentType;
 import org.opensearch.searchrelevance.model.ExperimentVariant;
 import org.opensearch.searchrelevance.utils.TimeUtils;
 
+import lombok.AllArgsConstructor;
 import lombok.extern.log4j.Log4j2;
 
 /**
  * Processor for handling HYBRID_OPTIMIZER experiments with non-blocking async operations
  */
 @Log4j2
+@AllArgsConstructor
 public class HybridOptimizerExperimentProcessor {
 
     private final JudgmentDao judgmentDao;
-    private final HybridSearchTaskManager taskManager;
-
-    public HybridOptimizerExperimentProcessor(JudgmentDao judgmentDao, HybridSearchTaskManager taskManager) {
-        this.judgmentDao = judgmentDao;
-        this.taskManager = taskManager;
-    }
+    private final ExperimentTaskManager taskManager;
 
     /**
      * Process hybrid optimizer experiment using non-blocking async operations
@@ -224,6 +221,7 @@ public class HybridOptimizerExperimentProcessor {
 
             // Use optimized task manager to process variants
             CompletableFuture<Map<String, Object>> configFuture = taskManager.scheduleTasksAsync(
+                ExperimentType.HYBRID_OPTIMIZER,
                 experimentId,
                 searchConfigId,
                 index,
