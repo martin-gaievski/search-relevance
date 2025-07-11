@@ -11,7 +11,6 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 OLLAMA_DIR="$PROJECT_ROOT/.ollama"
 
 echo "=== Stopping Local Ollama Environment ==="
-echo "No bridge to stop - using native OpenAI API!"
 echo ""
 
 # Stop Ollama service (if we started it)
@@ -85,23 +84,12 @@ else
     echo "  Ollama API: Stopped (port 11434 free)"
 fi
 
-# Clean up any old bridge files if they exist
-if [ -f "$OLLAMA_DIR/ollama_bridge.py" ]; then
-    echo ""
-    echo "Cleaning up old bridge files..."
-    rm -f "$OLLAMA_DIR/ollama_bridge.py"
-    rm -f "$OLLAMA_DIR/bridge.log"
-    rm -f "$OLLAMA_DIR/bridge.pid"
-    echo "Old bridge files removed"
-fi
-
 echo ""
 echo "Local Ollama Environment Cleanup Complete!"
 echo ""
 echo "What was cleaned up:"
 echo "  - Local Ollama processes (if started by setup script)"
 echo "  - PID files"
-echo "  - Old bridge files (no longer needed)"
 echo ""
 echo "To restart: ./scripts/setup-local-ollama.sh [model]"
 echo "Available models: tinyllama, phi3:mini, llama3.2:3b, etc."
