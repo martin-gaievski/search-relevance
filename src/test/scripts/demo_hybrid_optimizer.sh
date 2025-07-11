@@ -357,7 +357,7 @@ exe curl -s -X PUT "http://localhost:9200/_plugins/_search_relevance/search_conf
 -H "Content-type: application/json" \
 -d"{
       \"name\": \"hybrid_query\",
-      \"query\": \"{\\\"query\\\":{\\\"hybrid\\\":{\\\"queries\\\":[{\\\"multi_match\\\":{\\\"query\\\":\\\"%SearchText%\\\",\\\"fields\\\":[\\\"id\\\",\\\"title\\\",\\\"category\\\",\\\"bullets\\\",\\\"description\\\",\\\"attrs.Brand\\\",\\\"attrs.Color\\\"]}},{\\\"neural\\\":{\\\"title_embedding\\\":{\\\"query_text\\\":\\\"%SearchText%\\\",\\\"k\\\":100,\\\"model_id\\\":\\\"${model_id}\\\"}}}]}},\\\"size\\\":10}\",
+      \"query\": \"{\\\"query\\\":{\\\"hybrid\\\":{\\\"queries\\\":[{\\\"multi_match\\\":{\\\"query\\\":\\\"%SearchText%\\\",\\\"fields\\\":[\\\"id\\\",\\\"title\\\",\\\"category\\\",\\\"bullets\\\",\\\"description\\\",\\\"attrs.Brand\\\",\\\"attrs.Color\\\"]}},{\\\"neural\\\":{\\\"title_embedding\\\":{\\\"query_text\\\":\\\"%SearchText%\\\",\\\"k\\\":100,\\\"model_id\\\":\\\"${model_id}\\\"}}}]}},\\\"size\\\":10,\\\"search_pipeline\\\":{\\\"description\\\":\\\"Post processor for hybrid search\\\",\\\"phase_results_processors\\\":[{\\\"normalization-processor\\\":{\\\"normalization\\\":{\\\"technique\\\":\\\"min_max\\\"},\\\"combination\\\":{\\\"technique\\\":\\\"arithmetic_mean\\\",\\\"parameters\\\":{}}}}]}}\",
       \"index\": \"ecommerce\"
 }"
 
