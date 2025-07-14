@@ -60,7 +60,6 @@ import reactor.util.annotation.NonNull;
  * Manager for other local index operations.
  */
 public class MetricsHelper {
-    private final ClusterService clusterService;
     private final Client client;
     private final JudgmentDao judgmentDao;
     private final EvaluationResultDao evaluationResultDao;
@@ -74,7 +73,6 @@ public class MetricsHelper {
         @NonNull EvaluationResultDao evaluationResultDao,
         @NonNull ExperimentVariantDao experimentVariantDao
     ) {
-        this.clusterService = clusterService;
         this.client = client;
         this.judgmentDao = judgmentDao;
         this.evaluationResultDao = evaluationResultDao;
@@ -100,8 +98,9 @@ public class MetricsHelper {
             String searchConfigId = entry.getKey();
             String index = entry.getValue().get(0);
             String query = entry.getValue().get(1);
+            String pipeline = entry.getValue().get(2);
 
-            SearchRequest searchRequest = buildSearchRequest(index, query, queryText, null, size);
+            SearchRequest searchRequest = buildSearchRequest(index, query, queryText, pipeline, size);
 
             client.search(searchRequest, new ActionListener<SearchResponse>() {
                 @Override

@@ -14,6 +14,7 @@ Inspired from [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ### Bug Fixes
 * Bug fix on rest APIs error status for creations ([#176](https://github.com/opensearch-project/search-relevance/pull/176))
+* Fixed pipeline parameter being ignored in pairwise metrics processing for hybrid search queries ([#187](https://github.com/opensearch-project/search-relevance/pull/187))
 
 ### Infrastructure
 * Added end to end integration tests for experiments ([#154](https://github.com/opensearch-project/search-relevance/pull/154))
