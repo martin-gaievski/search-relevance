@@ -34,6 +34,7 @@ import org.opensearch.search.SearchHits;
 import org.opensearch.searchrelevance.dao.EvaluationResultDao;
 import org.opensearch.searchrelevance.dao.ExperimentVariantDao;
 import org.opensearch.searchrelevance.dao.JudgmentDao;
+import org.opensearch.searchrelevance.model.SearchConfigurationDetails;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.transport.client.Client;
 
@@ -62,9 +63,23 @@ public class MetricsHelperTests extends OpenSearchTestCase {
         String queryText = "test query";
         int size = 10;
 
-        Map<String, List<String>> indexAndQueries = new HashMap<>();
-        indexAndQueries.put("config1", Arrays.asList("index1", "{\"query\":{\"match\":{\"title\":\"%SearchText%\"}}}", "pipeline1"));
-        indexAndQueries.put("config2", Arrays.asList("index2", "{\"query\":{\"match\":{\"description\":\"%SearchText%\"}}}", "pipeline2"));
+        Map<String, SearchConfigurationDetails> searchConfigurations = new HashMap<>();
+        searchConfigurations.put(
+            "config1",
+            SearchConfigurationDetails.builder()
+                .index("index1")
+                .query("{\"query\":{\"match\":{\"title\":\"%SearchText%\"}}}")
+                .pipeline("pipeline1")
+                .build()
+        );
+        searchConfigurations.put(
+            "config2",
+            SearchConfigurationDetails.builder()
+                .index("index2")
+                .query("{\"query\":{\"match\":{\"description\":\"%SearchText%\"}}}")
+                .pipeline("pipeline2")
+                .build()
+        );
 
         // Mock search response
         SearchResponse mockResponse = createMockSearchResponse("doc1", "doc2", "doc3");
@@ -95,7 +110,7 @@ public class MetricsHelperTests extends OpenSearchTestCase {
             }
         };
 
-        metricsHelper.processPairwiseMetrics(queryText, indexAndQueries, size, resultListener);
+        metricsHelper.processPairwiseMetrics(queryText, searchConfigurations, size, resultListener);
 
         // Verify that search was called twice with correct pipelines
         verify(client, times(2)).search(any(SearchRequest.class), any(ActionListener.class));
@@ -122,8 +137,15 @@ public class MetricsHelperTests extends OpenSearchTestCase {
         String queryText = "test query";
         int size = 10;
 
-        Map<String, List<String>> indexAndQueries = new HashMap<>();
-        indexAndQueries.put("config1", Arrays.asList("index1", "{\"query\":{\"match\":{\"title\":\"%SearchText%\"}}}", null));
+        Map<String, SearchConfigurationDetails> searchConfigurations = new HashMap<>();
+        searchConfigurations.put(
+            "config1",
+            SearchConfigurationDetails.builder()
+                .index("index1")
+                .query("{\"query\":{\"match\":{\"title\":\"%SearchText%\"}}}")
+                .pipeline(null)
+                .build()
+        );
 
         // Mock search response
         SearchResponse mockResponse = createMockSearchResponse("doc1", "doc2");
@@ -140,7 +162,7 @@ public class MetricsHelperTests extends OpenSearchTestCase {
 
         // Execute the method
         ActionListener<Map<String, Object>> resultListener = mock(ActionListener.class);
-        metricsHelper.processPairwiseMetrics(queryText, indexAndQueries, size, resultListener);
+        metricsHelper.processPairwiseMetrics(queryText, searchConfigurations, size, resultListener);
 
         // Verify that null pipeline is handled correctly
         verify(client, times(1)).search(any(SearchRequest.class), any(ActionListener.class));
@@ -156,8 +178,15 @@ public class MetricsHelperTests extends OpenSearchTestCase {
         String queryText = "test query";
         int size = 10;
 
-        Map<String, List<String>> indexAndQueries = new HashMap<>();
-        indexAndQueries.put("config1", Arrays.asList("index1", "{\"query\":{\"match\":{\"title\":\"%SearchText%\"}}}", ""));
+        Map<String, SearchConfigurationDetails> searchConfigurations = new HashMap<>();
+        searchConfigurations.put(
+            "config1",
+            SearchConfigurationDetails.builder()
+                .index("index1")
+                .query("{\"query\":{\"match\":{\"title\":\"%SearchText%\"}}}")
+                .pipeline("")
+                .build()
+        );
 
         // Mock search response
         SearchResponse mockResponse = createMockSearchResponse("doc1");
@@ -174,7 +203,7 @@ public class MetricsHelperTests extends OpenSearchTestCase {
 
         // Execute the method
         ActionListener<Map<String, Object>> resultListener = mock(ActionListener.class);
-        metricsHelper.processPairwiseMetrics(queryText, indexAndQueries, size, resultListener);
+        metricsHelper.processPairwiseMetrics(queryText, searchConfigurations, size, resultListener);
 
         // Verify that empty pipeline is handled correctly
         verify(client, times(1)).search(any(SearchRequest.class), any(ActionListener.class));
