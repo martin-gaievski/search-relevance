@@ -573,12 +573,12 @@ ext.createDiffFile = { ->
     def diffBase = 'refs/remotes/origin/main'
     // Only run locally
     if (!System.getenv('CI')) {
-        file.withOutputStream { out ->
-            exec {
-                commandLine 'git', 'diff', '--no-color', '--minimal', diffBase
-                standardOutput = out
-            }
-        }
+        //file.withOutputStream { out ->
+        //    exec {
+        //        commandLine 'git', 'diff', '--no-color', '--minimal', diffBase
+        //        standardOutput = out
+        //    }
+        //}
     }
     return file
 }
