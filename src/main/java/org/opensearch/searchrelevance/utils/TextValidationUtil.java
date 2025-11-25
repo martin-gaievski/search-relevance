@@ -8,7 +8,7 @@
 package org.opensearch.searchrelevance.utils;
 
 public class TextValidationUtil {
-    private static final int DEFAULT_MAX_TEXT_LENGTH = 2000;
+    private static final int DEFAULT_MAX_TEXT_LENGTH = 50000;
     private static final int MAX_NAME_LENGTH = 50;
     private static final int MAX_DESCRIPTION_LENGTH = 250;
     // Characters that could break JSON or cause security issues

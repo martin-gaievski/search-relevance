@@ -12,6 +12,7 @@ import static org.opensearch.searchrelevance.common.MetricsConstants.PAIRWISE_FI
 import static org.opensearch.searchrelevance.metrics.EvaluationMetrics.calculateEvaluationMetrics;
 import static org.opensearch.searchrelevance.metrics.calculator.Evaluation.METRICS_NORMALIZED_DISCOUNTED_CUMULATIVE_GAIN_AT;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
@@ -358,6 +359,9 @@ public class SearchResponseProcessor {
                 );
             }
 
+            // Calculate and log distribution metrics
+            logDistributionMetrics(weightStats, totalQueries);
+
             // Calculate and log average of best NDCGs
             double avgBestNdcg = calculateAverageBestNDCG(experimentId);
             if (avgBestNdcg >= 0) {
@@ -366,6 +370,95 @@ public class SearchResponseProcessor {
 
             log.info("========================================================");
         }
+    }
+
+    /**
+     * Calculate and log distribution metrics for weight combinations
+     */
+    private void logDistributionMetrics(ConcurrentHashMap<String, Integer> weightStats, int totalQueries) {
+        // Calculate entropy (normalized)
+        double entropy = calculateNormalizedEntropy(weightStats, totalQueries);
+
+        // Calculate Gini coefficient
+        double gini = calculateGiniCoefficient(weightStats, totalQueries);
+
+        // Calculate coefficient of variation
+        double cv = calculateCoefficientOfVariation(weightStats);
+
+        log.info("===== DISTRIBUTION METRICS =====");
+        log.info("Normalized Entropy: {}", String.format("%.4f", entropy));
+        log.info("  (0 = concentrated on single weight, 1 = perfectly uniform)");
+        log.info("Gini Coefficient: {}", String.format("%.4f", gini));
+        log.info("  (0 = perfect equality, 1 = perfect inequality)");
+        log.info("Coefficient of Variation: {}", String.format("%.4f", cv));
+        log.info("  (< 0.5 = low variation, 0.5-1.0 = moderate, > 1.0 = high variation)");
+    }
+
+    /**
+     * Calculate normalized entropy to measure distribution uniformity
+     * Returns value between 0 (all queries on one weight) and 1 (perfectly uniform)
+     */
+    private double calculateNormalizedEntropy(Map<String, Integer> distribution, int total) {
+        if (distribution.size() <= 1) return 0.0;
+
+        double entropy = 0.0;
+        for (int count : distribution.values()) {
+            if (count > 0) {
+                double probability = (double) count / total;
+                entropy -= probability * Math.log(probability) / Math.log(2);
+            }
+        }
+
+        // Normalize by maximum possible entropy (log2 of number of categories)
+        double maxEntropy = Math.log(distribution.size()) / Math.log(2);
+        return maxEntropy > 0 ? entropy / maxEntropy : 0.0;
+    }
+
+    /**
+     * Calculate Gini coefficient to measure inequality in distribution
+     * Returns value between 0 (perfect equality) and 1 (perfect inequality)
+     */
+    private double calculateGiniCoefficient(Map<String, Integer> distribution, int total) {
+        List<Integer> values = new ArrayList<>(distribution.values());
+        values.sort(Integer::compareTo);
+
+        double cumulativeSum = 0.0;
+        double giniSum = 0.0;
+
+        for (int i = 0; i < values.size(); i++) {
+            cumulativeSum += values.get(i);
+            giniSum += cumulativeSum;
+        }
+
+        if (total == 0 || values.size() == 0) return 0.0;
+
+        double equalShare = (double) total / values.size();
+        double maxGiniSum = equalShare * values.size() * (values.size() + 1) / 2;
+
+        return 1.0 - (2.0 * giniSum) / (values.size() * total);
+    }
+
+    /**
+     * Calculate coefficient of variation (relative standard deviation)
+     * Measures relative variability of the distribution
+     */
+    private double calculateCoefficientOfVariation(Map<String, Integer> distribution) {
+        if (distribution.isEmpty()) return 0.0;
+
+        // Calculate mean
+        double sum = distribution.values().stream().mapToInt(Integer::intValue).sum();
+        double mean = sum / distribution.size();
+
+        // Calculate standard deviation
+        double variance = 0.0;
+        for (int value : distribution.values()) {
+            variance += Math.pow(value - mean, 2);
+        }
+        variance /= distribution.size();
+        double stdDev = Math.sqrt(variance);
+
+        // Return coefficient of variation
+        return mean > 0 ? stdDev / mean : 0.0;
     }
 
     /**

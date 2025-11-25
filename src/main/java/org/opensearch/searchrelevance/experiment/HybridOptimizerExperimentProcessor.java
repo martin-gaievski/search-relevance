@@ -81,16 +81,16 @@ public class HybridOptimizerExperimentProcessor {
         );
 
         for (ExperimentVariantHybridSearchDTO experimentVariantDTO : experimentVariantDTOs) {
-            Map<String, Object> parameters = new HashMap<>(
-                Map.of(
-                    EXPERIMENT_OPTION_NORMALIZATION_TECHNIQUE,
-                    experimentVariantDTO.getNormalizationTechnique(),
-                    EXPERIMENT_OPTION_COMBINATION_TECHNIQUE,
-                    experimentVariantDTO.getCombinationTechnique(),
-                    EXPERIMENT_OPTION_WEIGHTS_FOR_COMBINATION,
-                    experimentVariantDTO.getQueryWeightsForCombination()
-                )
-            );
+            Map<String, Object> parameters = new HashMap<>();
+
+            // Handle null normalization for RRF variants
+            if (experimentVariantDTO.getNormalizationTechnique() != null) {
+                parameters.put(EXPERIMENT_OPTION_NORMALIZATION_TECHNIQUE, experimentVariantDTO.getNormalizationTechnique());
+            }
+
+            parameters.put(EXPERIMENT_OPTION_COMBINATION_TECHNIQUE, experimentVariantDTO.getCombinationTechnique());
+            parameters.put(EXPERIMENT_OPTION_WEIGHTS_FOR_COMBINATION, experimentVariantDTO.getQueryWeightsForCombination());
+
             String experimentVariantId = UUID.randomUUID().toString();
 
             // Create lightweight ExperimentVariant without storing it to index

@@ -35,26 +35,49 @@ public class QuerySourceUtil {
      */
     public static Map<String, Object> createDefinitionOfTemporarySearchPipeline(final ExperimentVariant experimentVariant) {
         Map<String, Object> experimentVariantParameters = experimentVariant.getParameters();
-        Map<String, Object> normalizationTechniqueConfig = new HashMap<>(
-            Map.of("technique", experimentVariantParameters.get(EXPERIMENT_OPTION_NORMALIZATION_TECHNIQUE))
-        );
+        String combinationTechnique = (String) experimentVariantParameters.get(EXPERIMENT_OPTION_COMBINATION_TECHNIQUE);
 
-        Map<String, Object> combinationTechniqueConfig = new HashMap<>(
-            Map.of("technique", experimentVariantParameters.get(EXPERIMENT_OPTION_COMBINATION_TECHNIQUE))
-        );
-        if (Objects.nonNull(experimentVariantParameters.get(EXPERIMENT_OPTION_WEIGHTS_FOR_COMBINATION))) {
-            float[] weights = (float[]) experimentVariantParameters.get(EXPERIMENT_OPTION_WEIGHTS_FOR_COMBINATION);
-            List<Double> weightsList = new ArrayList<>(weights.length);
-            for (float weight : weights) {
-                weightsList.add((double) weight);
+        Map<String, Object> phaseProcessorObject;
+
+        // Check if this is RRF (rank-based) configuration
+        if ("rrf".equals(combinationTechnique)) {
+            // RRF uses score-ranker-processor without normalization
+            Map<String, Object> combinationTechniqueConfig = new HashMap<>(Map.of("technique", combinationTechnique));
+
+            if (Objects.nonNull(experimentVariantParameters.get(EXPERIMENT_OPTION_WEIGHTS_FOR_COMBINATION))) {
+                float[] weights = (float[]) experimentVariantParameters.get(EXPERIMENT_OPTION_WEIGHTS_FOR_COMBINATION);
+                List<Double> weightsList = new ArrayList<>(weights.length);
+                for (float weight : weights) {
+                    weightsList.add((double) weight);
+                }
+                combinationTechniqueConfig.put("parameters", new HashMap<>(Map.of("weights", weightsList)));
             }
-            combinationTechniqueConfig.put("parameters", new HashMap<>(Map.of("weights", weightsList)));
+
+            Map<String, Object> scoreRankerProcessorConfig = new HashMap<>(Map.of("combination", combinationTechniqueConfig));
+            phaseProcessorObject = new HashMap<>(Map.of("score-ranker-processor", scoreRankerProcessorConfig));
+        } else {
+            // Regular normalization-processor for non-RRF techniques
+            Map<String, Object> normalizationTechniqueConfig = new HashMap<>(
+                Map.of("technique", experimentVariantParameters.get(EXPERIMENT_OPTION_NORMALIZATION_TECHNIQUE))
+            );
+
+            Map<String, Object> combinationTechniqueConfig = new HashMap<>(Map.of("technique", combinationTechnique));
+
+            if (Objects.nonNull(experimentVariantParameters.get(EXPERIMENT_OPTION_WEIGHTS_FOR_COMBINATION))) {
+                float[] weights = (float[]) experimentVariantParameters.get(EXPERIMENT_OPTION_WEIGHTS_FOR_COMBINATION);
+                List<Double> weightsList = new ArrayList<>(weights.length);
+                for (float weight : weights) {
+                    weightsList.add((double) weight);
+                }
+                combinationTechniqueConfig.put("parameters", new HashMap<>(Map.of("weights", weightsList)));
+            }
+
+            Map<String, Object> normalizationProcessorConfig = new HashMap<>(
+                Map.of("normalization", normalizationTechniqueConfig, "combination", combinationTechniqueConfig)
+            );
+            phaseProcessorObject = new HashMap<>(Map.of("normalization-processor", normalizationProcessorConfig));
         }
 
-        Map<String, Object> normalizationProcessorConfig = new HashMap<>(
-            Map.of("normalization", normalizationTechniqueConfig, "combination", combinationTechniqueConfig)
-        );
-        Map<String, Object> phaseProcessorObject = new HashMap<>(Map.of("normalization-processor", normalizationProcessorConfig));
         Map<String, Object> temporarySearchPipeline = new HashMap<>();
         temporarySearchPipeline.put("phase_results_processors", List.of(phaseProcessorObject));
         return temporarySearchPipeline;

@@ -44,12 +44,31 @@ public class ExperimentOptionsFactory {
     private static ExperimentOptionsForHybridSearch getExperimentOptionsForHybridSearch(Map<String, Object> params) {
         ExperimentOptionsForHybridSearch.ExperimentOptionsForHybridSearchBuilder builder = ExperimentOptionsForHybridSearch.builder();
 
+        Set<String> normalizationTechniques = null;
+        Set<String> combinationTechniques = null;
+
         if (params.containsKey("normalizationTechniques")) {
-            builder.normalizationTechniques((Set<String>) params.get("normalizationTechniques"));
+            normalizationTechniques = (Set<String>) params.get("normalizationTechniques");
+            builder.normalizationTechniques(normalizationTechniques);
         }
 
         if (params.containsKey("combinationTechniques")) {
-            builder.combinationTechniques((Set<String>) params.get("combinationTechniques"));
+            combinationTechniques = (Set<String>) params.get("combinationTechniques");
+            builder.combinationTechniques(combinationTechniques);
+        }
+
+        // Validate z_score compatibility
+        if (normalizationTechniques != null && combinationTechniques != null) {
+            if (normalizationTechniques.contains("z_score")) {
+                // z_score requires arithmetic_mean to be available as a combination technique
+                if (!combinationTechniques.contains("arithmetic_mean")) {
+                    throw new IllegalArgumentException(
+                        "z_score normalization technique requires arithmetic_mean to be included in combination techniques. "
+                            + "Found combination techniques: "
+                            + combinationTechniques
+                    );
+                }
+            }
         }
 
         if (params.containsKey("weightsRange")) {
@@ -83,9 +102,9 @@ public class ExperimentOptionsFactory {
     public static Map<String, Object> createDefaultExperimentParametersForHybridSearch() {
         return Map.of(
             "normalizationTechniques",
-            Set.of("min_max", "l2"),
+            Set.of("min_max", "l2", "z_score"),
             "combinationTechniques",
-            Set.of("arithmetic_mean", "geometric_mean", "harmonic_mean"),
+            Set.of("arithmetic_mean", "geometric_mean", "harmonic_mean", "rrf"),
             "weightsRange",
             Map.of("rangeMin", 0.0, "rangeMax", 1.0, "increment", 0.1)
         );
